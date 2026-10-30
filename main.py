@@ -149,20 +149,25 @@ if __name__ == '__main__':
 
         # 1. kikoeru 后台模式：--config 和 root 同时指定时，命令行参数优先
         input_path_file = SCRIPT_DIR / 'input_path.txt'
+        roots: list[Path] = []
         if args.config is not None and args.root is not None:
-            root = Path(args.root)
-            print(f"[入口] 从命令行参数读取工作目录: {root}")
+            roots = [Path(args.root)]
+            print(f"[入口] 从命令行参数读取工作目录: {roots[0]}")
         elif input_path_file.exists():
-            # 2. 传统 bat 拖放模式：input_path.txt 优先
+            # 2. 传统 bat 拖放模式：input_path.txt 优先（多行 = 多个目录，串行处理）
             try:
-                content = input_path_file.read_text(encoding='utf-8').strip()
-                if content:
-                    root = Path(content)
-                    print(f"[入口] 从 input_path.txt 读取工作目录: {root}")
+                for _line in input_path_file.read_text(encoding='utf-8').splitlines():
+                    _line = _line.strip()
+                    if _line:
+                        roots.append(Path(_line))
+                if roots:
+                    print(f"[入口] 从 input_path.txt 读取 {len(roots)} 个工作目录")
             except Exception:
                 pass
         elif args.root is not None:
-            root = Path(args.root)
+            roots = [Path(args.root)]
+        if not roots:
+            roots = [root]
 
         config_path = Path(args.config) if args.config else None
 
@@ -183,7 +188,7 @@ if __name__ == '__main__':
             print(f'[入口] 代理配置读取失败（保留系统代理）: {_pe}')
 
         run_pipeline(
-            root,
+            roots if len(roots) > 1 else roots[0],
             config_path=config_path,
             use_gpu=args.gpu,
         )

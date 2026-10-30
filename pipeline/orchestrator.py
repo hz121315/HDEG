@@ -604,6 +604,28 @@ class PipelineContext:
             _mfr = 3
         self.max_failed_retries = max(1, _mfr)
 
+        # ── 流水线（转录与翻译交叠执行）与逐文件判定相关配置 ──
+        self.stream_workflow = bool(self.app_cfg.get('stream_workflow', True))
+        try:
+            self.transcribe_settle_seconds = float(self.app_cfg.get('transcribe_settle_seconds', 2.0) or 2.0)
+        except (TypeError, ValueError):
+            self.transcribe_settle_seconds = 2.0
+        try:
+            self.transcribe_poll_interval = float(self.app_cfg.get('transcribe_poll_interval', 0.5) or 0.5)
+        except (TypeError, ValueError):
+            self.transcribe_poll_interval = 0.5
+        try:
+            self.parallel_works = max(1, int(self.app_cfg.get('parallel_works', 10) or 10))
+        except (TypeError, ValueError):
+            self.parallel_works = 10
+        self.work_progress_windows = bool(self.app_cfg.get('work_progress_windows', True))
+        self.skip_hanhua_files = bool(self.app_cfg.get('skip_hanhua_files', False))
+        self.srt_vtt_resync = bool(self.app_cfg.get('srt_vtt_resync', True))
+
+        # RJ 号向上查找层数（进程级，供 find_rj_work_root 的默认值使用）
+        from io_adapter.file_scanner import set_rj_lookup_depth
+        set_rj_lookup_depth(self.app_cfg.get('rj_lookup_depth', 4))
+
     @property
     def translate_engine(self) -> TranslateEngine:
         if self._translate_engine is None:
@@ -685,24 +707,6 @@ def scan_subtitle_files(work_dir: Path) -> tuple[list[Path], list[Path], int, di
         if count > 0:
             _log(f"    {ext}: {count} 个")
 
-    # 从留档恢复缺失的文件
-    restored = 0
-    for ja_f in ja_files:
-        # .ja.lrc → .lrc, .ja.srt → .srt, .ja.vtt → .vtt
-        ja_stem = ja_f.stem
-        if ja_stem.endswith('.ja'):
-            base_name = ja_stem[:-3]
-            ext = ja_f.suffix  # 已经是完整扩展名 .lrc/.srt/.vtt
-            target_path = ja_f.parent / f"{base_name}{ext}"
-            if not target_path.exists():
-                shutil.copy2(ja_f, target_path)
-                _log(f"  [恢复] {base_name}{ext} (从 {ja_f.name})")
-                all_files.append(target_path)
-                restored += 1
-
-    if restored > 0:
-        _log(f"  → 从留档恢复: {restored} 个文件")
-
     # 按修改时间排序
     all_files.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0)
 
@@ -712,7 +716,7 @@ def scan_subtitle_files(work_dir: Path) -> tuple[list[Path], list[Path], int, di
         parent = f.parent
         file_groups.setdefault(parent, []).append(f)
 
-    return all_files, ja_files, restored, file_groups
+    return all_files, ja_files, 0, file_groups
 
 
 # 兼容旧接口
@@ -755,6 +759,214 @@ def sync_lrc_to_srt_vtt(lrc_path: Path, translated_texts: list[str]) -> int:
             _log(f"  [同步] {ext} 失败: {e}")
 
     return synced
+
+
+# ==================== 逐文件判定辅助 ====================
+
+# 视频来源（这些扩展名在翻译完成后额外产出 srt/vtt）
+_VIDEO_EXTS = {'.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.wmv',
+               '.m4v', '.ts', '.m2ts', '.mpg', '.mpeg', '.3gp'}
+
+# 人工汉化产物的文件名后缀
+_HANHUA_SUFFIXES = ('汉化', '漢化')
+
+
+def _is_hanhua_audio(audio: Path) -> bool:
+    """文件名以「汉化/漢化」结尾 → 人工汉化产物，整轨跳过。"""
+    return audio.stem.endswith(_HANHUA_SUFFIXES)
+
+
+def _lrc_for_audio(audio: Path) -> Path:
+    """音频对应的目标字幕 A.lrc。"""
+    return audio.parent / f'{audio.stem}.lrc'
+
+
+def _ja_for_audio(audio: Path) -> Path:
+    """音频对应的日文留档 A.ja.lrc。"""
+    return audio.parent / f'{audio.stem}.ja.lrc'
+
+
+def _is_video_source(lrc_path: Path) -> bool:
+    """同目录存在同名视频文件即视为视频来源。"""
+    for ext in _VIDEO_EXTS:
+        if (lrc_path.parent / f'{lrc_path.stem}{ext}').exists():
+            return True
+    return False
+
+
+def _maybe_generate_video_subs(lrc_path: Path, ctx: PipelineContext) -> None:
+    """视频来源额外生成同名 srt、vtt（受 app.srt_vtt_resync 控制）。
+
+    已有同名文件时由 sync_lrc_to_srt_vtt 按原时间轴覆盖，这里只补齐缺失的。
+    """
+    if not ctx.config.get('app', {}).get('srt_vtt_resync', True):
+        return
+    if lrc_path.suffix.lower() != '.lrc' or not _is_video_source(lrc_path):
+        return
+    from io_adapter.lrc_handler import write_srt_from_lrc, write_vtt_from_lrc
+    for writer, ext in ((write_srt_from_lrc, '.srt'), (write_vtt_from_lrc, '.vtt')):
+        target = lrc_path.parent / f'{lrc_path.stem}{ext}'
+        if target.exists():
+            continue
+        try:
+            if writer(lrc_path, target):
+                _log(f"  [视频字幕] 生成 {target.name}")
+        except Exception as e:
+            _log(f"  [视频字幕] 生成 {ext} 失败: {e}")
+
+
+def _archive_lrc_to_ja(lrc_path: Path, run_start_ts: float) -> bool:
+    """把转录产物 A.lrc 归档为 A.ja.lrc，并删除 A.lrc。
+
+    这样 A.lrc 只会在翻译成功后才出现，成为可靠的"已完成"标记。
+    只处理本次运行新写的文件（mtime 早于运行开始的视为历史产物，不动）；
+    已存在 .ja.lrc 时不覆盖用户留档。
+    """
+    if lrc_path.name.endswith('.ja.lrc'):
+        return False
+    try:
+        st = lrc_path.stat()
+    except OSError:
+        return False
+    if st.st_mtime < run_start_ts - 1.0:
+        return False
+    ja_path = lrc_path.with_name(f'{lrc_path.stem}.ja.lrc')
+    if not ja_path.exists():
+        try:
+            shutil.copy2(lrc_path, ja_path)
+        except OSError:
+            return False
+    try:
+        lrc_path.unlink()
+    except OSError:
+        # 删除失败时宁可留着（下次运行会按"已有 A.lrc"跳过），也不丢归档
+        return False
+    return True
+
+
+def _track_key(work_root: Path, path: Path) -> str:
+    """作品内唯一音轨键：优先用相对路径（含子目录），退化时用 stem。
+
+    同一 RJ 目录下 本編/01 与 特典/01 同名文件在旧实现里都以 "01" 为键，
+    台本映射与 ASR 样本会互相覆盖；改用相对路径后两者互不干扰。
+    """
+    try:
+        rel = path.resolve().relative_to(work_root.resolve())
+    except (ValueError, OSError):
+        return path.stem
+    name = rel.name
+    if name.lower().endswith('.ja.lrc'):
+        name = name[:-len('.ja.lrc')]
+    else:
+        name = rel.stem
+    parent = rel.parent.as_posix()
+    return f'{parent}/{name}' if parent not in ('', '.') else name
+
+
+# ==================== 待翻译任务收集 ====================
+
+_DEFAULT_AUDIO_SUFFIXES = 'mp3,wav,flac,m4a,aac,ogg,wma,mp4,mkv,avi,mov,webm,flv,wmv'
+
+
+def _audio_exts_from_config(ctx: PipelineContext) -> set[str]:
+    """从 transcription.audio_suffixes 得到音频扩展名集合（带点的形式）。
+
+    本地待转录检测与传给 infer.exe 的参数共用这一处配置，避免两套来源漂移。
+    """
+    raw = (ctx.config.get('transcription', {}) or {}).get('audio_suffixes') or _DEFAULT_AUDIO_SUFFIXES
+    exts: set[str] = set()
+    for part in str(raw).split(','):
+        p = part.strip().lower().lstrip('.')
+        if p:
+            exts.add('.' + p)
+    return exts or {'.mp3'}
+
+
+def _collect_translation_pairs(work_dir: Path, ctx: PipelineContext,
+                               only: set[Path] | None = None) -> tuple[list[Path], dict, dict]:
+    """按「A.lrc 存在即已完成」收集待翻译任务。
+
+    规则（以音频/字幕为锚点）：
+      - 已有 A.lrc → 跳过（计入 skipped）
+      - 无 A.lrc、有 A.ja.lrc → 翻译，源为 A.ja.lrc
+      - 无 A.lrc、无 A.ja.lrc、有音频 → 交给转录阶段
+      - 文件名以「汉化/漢化」结尾（app.skip_hanhua_files）→ 跳过
+
+    参数:
+        only: 仅收集这些目录下的文件（流式派发按作品组调用）；None 表示全目录
+
+    返回: (targets, source_map, audio_map)
+        targets: 待生成的 A.lrc 路径列表
+        source_map: target -> 源字幕（A.ja.lrc）
+        audio_map: target -> 对应音频（可能不存在）
+    """
+    app_cfg = ctx.config.get('app', {}) or {}
+    skip_hanhua = bool(app_cfg.get('skip_hanhua_files', False))
+    audio_exts = _audio_exts_from_config(ctx)
+
+    def _in_scope(path: Path) -> bool:
+        if only is None:
+            return True
+        return any(_is_under(path, root) for root in only)
+
+    targets: list[Path] = []
+    source_map: dict[Path, Path] = {}
+    audio_map: dict[Path, Path] = {}
+
+    # 收集音频（用于绑定 target→audio 与汉化过滤）
+    audios: list[Path] = []
+    for f in work_dir.rglob('*'):
+        if not f.is_file():
+            continue
+        if 'Hde_G_bug_lrc_collection' in f.parts:
+            continue
+        if f.suffix.lower() not in audio_exts:
+            continue
+        if not _in_scope(f):
+            continue
+        if skip_hanhua and _is_hanhua_audio(f):
+            ctx.stats['skipped'] += 1
+            _debug(f"跳过汉化文件: {f.name}")
+            continue
+        audios.append(f)
+
+    audio_by_target = {_lrc_for_audio(a): a for a in audios}
+
+    # 以 .ja.lrc 为源的候选
+    for ja in sorted(work_dir.rglob('*.ja.lrc')):
+        if 'Hde_G_bug_lrc_collection' in ja.parts:
+            continue
+        if not _in_scope(ja):
+            continue
+        stem = ja.name[:-len('.ja.lrc')]
+        target = ja.with_name(f'{stem}.lrc')
+        audio = audio_by_target.get(target)
+        if audio is not None and _is_hanhua_audio(audio):
+            continue
+        if target.exists():
+            ctx.stats['skipped'] += 1
+            _debug(f"已存在译文，跳过: {target.name}")
+            continue
+        targets.append(target)
+        source_map[target] = ja
+        if audio is not None:
+            audio_map[target] = audio
+
+    # 有音频、已有 A.lrc 的也计入跳过（规则：存在即完成）
+    for audio, target in audio_by_target.items():
+        if target.exists() and target not in source_map:
+            ctx.stats['skipped'] += 1
+
+    return targets, source_map, audio_map
+
+
+def _is_under(path: Path, root: Path) -> bool:
+    """path 是否位于 root 之下（大小写不敏感，兼容 Windows）。"""
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except (ValueError, OSError):
+        return False
 
 
 # ==================== 台本加载 ====================
@@ -1117,16 +1329,16 @@ def _extract_track_asr_samples(work_dir: Path, track_names: list[str], max_lines
     """
     from io_adapter.lrc_handler import parse_lrc_file
     samples: dict[str, str] = {}
-    # 递归收集所有 .ja.lrc，按 stem 建索引（处理文件分散在子目录的情况）
+    # 递归收集所有 .ja.lrc，按「作品内相对路径」建索引（同名文件不再互相覆盖）
     ja_map: dict[str, Path] = {}
     for ja_file in work_dir.rglob('*.ja.lrc'):
-        stem = ja_file.stem
-        if stem.endswith('.ja'):
-            stem = stem[:-3]
-        ja_map[stem] = ja_file
+        ja_map[_track_key(work_dir, ja_file)] = ja_file
 
     for name in track_names:
         ja_path = ja_map.get(name)
+        if ja_path is None:
+            # 兼容旧版以 stem 为键的调用
+            ja_path = ja_map.get(str(name).split('/')[-1])
         if ja_path is None:
             continue
         try:
@@ -1946,28 +2158,38 @@ def translate_one_lrc(
     attempts: int = 0,
     label: str = None,
     wkey: str = '',
+    source_path: Path = None,
+    target_path: Path = None,
 ) -> bool:
     """
     翻译单个 LRC 文件
 
     流程：
-      1. 解析 LRC 时间轴
+      1. 解析源字幕（默认与目标相同；流水线模式下源是 A.ja.lrc）
       2. 提取文本行
       3. 分块调用 LLM 翻译
-      4. 覆盖写入原 .lrc（翻译后的中文）
+      4. 成功后才写入目标 .lrc（原子写），失败不产生任何目标文件
+
+    参数:
+        source_path: 解析与翻译的源文件（默认 lrc_path）
+        target_path: 译文写回路径（默认 lrc_path）
 
     返回:
         True 表示翻译成功
     """
-    abs_path = lrc_path.absolute()
-    ext = lrc_path.suffix.lower()
+    source_path = Path(source_path) if source_path else lrc_path
+    target_path = Path(target_path) if target_path else lrc_path
+    abs_path = target_path.absolute()
+    ext = target_path.suffix.lower()
     _log(f"\n{'─'*60}")
     _log(f"[翻译文件] {abs_path}")
-    _log(f"  文件名: {lrc_path.name}")
-    _log(f"  所在目录: {lrc_path.parent.absolute()}")
+    _log(f"  文件名: {target_path.name}")
+    _log(f"  所在目录: {target_path.parent.absolute()}")
+    if source_path != target_path:
+        _log(f"  源字幕: {source_path.name}")
 
     # 使用通用字幕解析器（支持 LRC/SRT/VTT）
-    sub_file = parse_subtitle_file(lrc_path)
+    sub_file = parse_subtitle_file(source_path)
     if sub_file is None:
         _log(f"  [跳过] 无文本内容")
         return False
@@ -1976,29 +2198,10 @@ def translate_one_lrc(
     total_chars = sum(len(t) for t in texts)
     _log(f"  [解析] {len(texts)} 行文本, {total_chars} 字符")
 
-    # 原文全空 → 尝试从 .ja.lrc 恢复（上次翻译可能写坏了）
-    if total_chars == 0 and len(texts) > 0:
-        ja_path = lrc_path.parent / f"{lrc_path.stem}.ja{lrc_path.suffix}"
-        if ja_path.exists():
-            _log(f"  [恢复] 原文为空，从 {ja_path.name} 恢复")
-            shutil.copy2(ja_path, lrc_path)
-            sub_file = parse_subtitle_file(lrc_path)
-            if sub_file:
-                texts = sub_file.original_lyrics
-                total_chars = sum(len(t) for t in texts)
-                _log(f"  [恢复] 重新解析: {len(texts)} 行, {total_chars} 字符")
-        if total_chars == 0:
-            _log(f"  [跳过] 原文内容为空（仅有时间戳），跳过翻译")
-            with ctx.thread_lock:
-                ctx.stats["skipped"] += 1
-            return False
-
-    # 检测是否已是中文（启发式：若大部分字符在 CJK 范围则跳过）
-    lang = detect_subtitle_language(lrc_path)
-    if lang == "chinese":
-        _log(f"  [跳过] 已是中文，保留原文件")
+    if total_chars == 0:
+        _log(f"  [跳过] 原文内容为空（仅有时间戳），跳过翻译")
         with ctx.thread_lock:
-            ctx.stats["kept"] += 1
+            ctx.stats["skipped"] += 1
         return False
 
     _log(f"  [待翻译] {len(texts)} 行文本")
@@ -2311,19 +2514,18 @@ def translate_one_lrc(
         except Exception as _pe:
             _log(f"  [润色] 失败: {_pe}")
 
-    # 创建 .ja.* 留档（翻译前保留日文原版）
+    # 创建 .ja.* 留档（仅旧路径：源与目标同一文件时才需要；流水线模式下源本就是 .ja）
     export_ja = ctx.config.get('app', {}).get('export_ja_lrc', True)
-    if export_ja:
-        ja_stem = lrc_path.stem
-        ja_path = lrc_path.parent / f"{ja_stem}.ja{ext}"
+    if export_ja and source_path == target_path and ext == '.lrc':
+        ja_path = target_path.parent / f"{target_path.stem}.ja{ext}"
         if not ja_path.exists():
             try:
-                shutil.copy2(lrc_path, ja_path)
-                _log(f"  [留档] {lrc_path.name} -> {ja_path.name}")
+                shutil.copy2(target_path, ja_path)
+                _log(f"  [留档] {target_path.name} -> {ja_path.name}")
                 with ctx.thread_lock:
                     ctx.stats['archived'] = ctx.stats.get('archived', 0) + 1
             except Exception as e:
-                _log(f"  [留档失败] {lrc_path.name}: {e}")
+                _log(f"  [留档失败] {target_path.name}: {e}")
 
     # 翻译全空但原文非空 → 不覆盖，保留原文件
     trans_chars = sum(len(t) for t in translated_texts if t)
@@ -2334,29 +2536,39 @@ def translate_one_lrc(
         return False
 
     # 写回翻译结果（通用字幕格式；过滤空行，只保留非空歌词行）
+    # 原子写：进程中途被杀只会留下完整旧文件或完整新文件，不会产生半截字幕
     from io_adapter.lrc_handler import write_subtitle_file_nonempty
-    write_subtitle_file_nonempty(sub_file, translated_texts, lrc_path)
+    write_subtitle_file_nonempty(sub_file, translated_texts, target_path)
     _log(f"\n[写入] -> {abs_path}")
     _log(f"  -> 翻译完成: {len(translated_texts)} 行中文（已去除空行）")
     with ctx.thread_lock:
         ctx.stats['translated'] += 1
 
     # 同步中文到同目录的 SRT/VTT
-    sync_lrc_to_srt_vtt(lrc_path, translated_texts)
+    sync_lrc_to_srt_vtt(target_path, translated_texts)
+
+    # 视频来源：额外生成/修复同名 srt、vtt
+    _maybe_generate_video_subs(target_path, ctx)
 
     return True
 
 
 # ==================== 语音转录 ====================
 
-def _run_transcription_if_needed(work_dir: Path, ctx: PipelineContext) -> None:
+def _run_transcription_if_needed(work_dir: Path, ctx: PipelineContext,
+                                 on_group_ready: Callable[[str], None] = None) -> None:
     """检测音频文件，自动调用 infer.exe 转录生成 .ja.lrc
 
-    参照 翻译_debug.bat 的流程：
-    1. 恢复 .ja.lrc -> .lrc（如果 .lrc 缺失）
-    2. 检测未转录的音频
-    3. 调用 infer.exe 转录
-    4. 将生成的 .lrc 留档为 .ja.lrc
+    逐文件判定只看 A.lrc 是否存在：
+      1. 已有 A.lrc → 整轨跳过（视为翻译完成）
+      2. 无 A.lrc、已有 A.ja.lrc → 跳过转录（后续直接用 .ja.lrc 翻译）
+      3. 都没有 → 需要转录
+
+    转录期间由 LrcSettleWatcher 实时判定写稳的字幕：归档为 A.ja.lrc 并删除 A.lrc，
+    使 A.lrc 只代表"翻译完成"，进程被杀也不会留下会被误判为已完成的中途产物。
+
+    参数:
+        on_group_ready: 某作品组待转录音频全部写完时的回调（流式派发用）
     """
     import os
     import subprocess
@@ -2401,50 +2613,46 @@ def _run_transcription_if_needed(work_dir: Path, ctx: PipelineContext) -> None:
     _log(f"[转录] 引擎: {exe_path}")
     _log(f"[转录] 设备: {device}  精度: {compute_type}")
 
-    audio_exts = {'.mp3', '.wav', '.flac', '.m4a', '.aac', '.ogg', '.wma',
-                  '.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.wmv'}
+    app_cfg = ctx.config.get('app', {}) or {}
+    skip_hanhua = bool(app_cfg.get('skip_hanhua_files', False))
+    audio_exts = _audio_exts_from_config(ctx)
+    run_start_ts = time.time()
 
     pending: list[Path] = []
-    restored = 0
+    already_done = 0
 
-    # ── 步骤 0a: 恢复 .ja.lrc → .lrc（如果 .lrc 缺失），同时收集待转录音频 ──
     for f in sorted(work_dir.rglob('*')):
         if not f.is_file():
             continue
-        suffix = f.suffix.lower()
-
-        # 恢复日文留档
-        if suffix == '.ja.lrc' or (suffix == '.lrc' and f.stem.endswith('.ja')):
-            base_name = f.stem
-            if base_name.endswith('.ja'):
-                base_name = base_name[:-3]
-            lrc_path = f.parent / f'{base_name}.lrc'
-            if not lrc_path.exists():
-                try:
-                    shutil.copy2(str(f), str(lrc_path))
-                    restored += 1
-                except Exception:
-                    pass
+        if 'Hde_G_bug_lrc_collection' in f.parts:
             continue
-
-        # 收集未转录的音频
-        if suffix not in audio_exts:
+        if f.suffix.lower() not in audio_exts:
             continue
-        ja_path = f.parent / f'{f.stem}.ja.lrc'
-        if ja_path.exists():
+        if skip_hanhua and _is_hanhua_audio(f):
+            already_done += 1
+            continue
+        # 规则 1：已有 A.lrc → 视为翻译完成，跳过
+        if _lrc_for_audio(f).exists():
+            already_done += 1
+            continue
+        # 规则 2：已有 A.ja.lrc → 跳过转录，后续直接翻译
+        if _ja_for_audio(f).exists():
             continue
         pending.append(f)
 
-    if restored:
-        _log(f"[转录] 恢复 .ja.lrc -> .lrc: {restored} 个")
+    if already_done:
+        _log(f"[转录] 跳过已有译文/汉化产物: {already_done} 个")
 
     if not pending:
-        _log("[转录] 所有音频已有 .ja.lrc，无需转录")
+        _log("[转录] 所有音频均已转录或已有译文，无需转录")
         return
 
     _log(f"[转录] 待转录音频: {len(pending)} 个")
     for p in pending[:10]:
-        _log(f"  → {p.relative_to(work_dir)}")
+        try:
+            _log(f"  → {p.relative_to(work_dir)}")
+        except ValueError:
+            _log(f"  → {p}")
     if len(pending) > 10:
         _log(f"  → ... 还有 {len(pending) - 10} 个")
 
@@ -2476,6 +2684,28 @@ def _run_transcription_if_needed(work_dir: Path, ctx: PipelineContext) -> None:
 
     _log(f"[转录] {' '.join(cmd)}")
     _log()
+
+    # ── 启动转录看护：实时判定写稳 → 归档 .ja.lrc 并删除 .lrc → 作品组就绪即回调 ──
+    from pipeline.transcribe_watch import LrcSettleWatcher
+    settle = float(app_cfg.get('transcribe_settle_seconds', 2.0) or 2.0)
+    poll = float(app_cfg.get('transcribe_poll_interval', 0.5) or 0.5)
+
+    def _archive(lrc_path: Path) -> bool:
+        ok = _archive_lrc_to_ja(lrc_path, run_start_ts)
+        if ok:
+            with ctx.thread_lock:
+                ctx.stats['archived'] = ctx.stats.get('archived', 0) + 1
+        return ok
+
+    watcher = LrcSettleWatcher(
+        pending,
+        settle_seconds=settle,
+        poll_interval=poll,
+        archive_cb=_archive,
+        group_ready_cb=on_group_ready,
+        run_start_ts=run_start_ts,
+    )
+    watcher.start()
 
     import threading
     try:
@@ -2522,31 +2752,17 @@ def _run_transcription_if_needed(work_dir: Path, ctx: PipelineContext) -> None:
         if proc.returncode != 0:
             _log(f"[转录] infer.exe 退出码: {proc.returncode}")
             if proc.returncode == -9:
-                _log(f"[转录] infer.exe 因卡死被强制终止，跳过转录")
-            return
+                _log(f"[转录] infer.exe 因卡死被强制终止，已产生的字幕仍会归档")
     except FileNotFoundError:
         _log(f"[转录] 找不到 infer.exe: {exe_path}")
-        return
     except Exception as e:
         _log(f"[转录] 异常: {e}")
-        return
+    finally:
+        # 无论 infer 正常结束、失败还是被杀，都对已产出的字幕做收尾归档
+        watcher.finish()
 
-    # ── 步骤 0c: 生成的 .lrc 留档为 .ja.lrc ──
-    _log()
-    _log("[转录] 转录完成，生成 .ja.lrc 留档...")
-    archived = 0
-    for f in pending:
-        lrc_path = f.parent / f'{f.stem}.lrc'
-        ja_path = f.parent / f'{f.stem}.ja.lrc'
-        if lrc_path.exists() and not ja_path.exists():
-            try:
-                shutil.copy2(str(lrc_path), str(ja_path))
-                archived += 1
-            except Exception:
-                pass
+    _log(f"[转录] 实时归档完成: {watcher.settled_count()} 个 .ja.lrc")
 
-    _log(f"[转录] 留档: {archived} 个，恢复: {restored} 个")
-    ctx.stats['archived'] = ctx.stats.get('archived', 0) + archived + restored
 
 
 # ==================== 峰谷调度 ====================
@@ -2673,6 +2889,247 @@ def _preflight_api_check(ctx: PipelineContext) -> None:
     sys.exit(1)
 
 
+# ==================== 流式流水线（转录与翻译交叠） ====================
+
+def _work_label(wkey: str) -> str:
+    """作品目录 → 短标识（RJ 号或目录名）。"""
+    import re as _re
+    m = _re.search(r'RJ(\d+)', wkey)
+    return f"RJ{m.group(1)}" if m else Path(wkey).name
+
+
+def _groups_with_pending_audio(root: Path, ctx: PipelineContext) -> set[str]:
+    """仍需转录的作品键集合（这些作品要等转录完成才能派发）。"""
+    skip_hanhua = bool(ctx.config.get('app', {}).get('skip_hanhua_files', False))
+    exts = _audio_exts_from_config(ctx)
+    out: set[str] = set()
+    for f in root.rglob('*'):
+        if not f.is_file() or f.suffix.lower() not in exts:
+            continue
+        if skip_hanhua and _is_hanhua_audio(f):
+            continue
+        if _lrc_for_audio(f).exists() or _ja_for_audio(f).exists():
+            continue
+        rj_root, _ = find_rj_work_root(f)
+        out.add(str(rj_root) if rj_root else str(f.parent))
+    return out
+
+
+def _analyze_group_stream(ctx: PipelineContext, wkey: str, targets: list[Path]):
+    """流式路径的单作品分析：台本（缓存优先）+ 术语/alias/世界观。"""
+    group_root = Path(wkey)
+    track_names = [_track_key(group_root, t) for t in targets]
+    samples = _extract_track_asr_samples(group_root, track_names)
+    scriptbook = _try_load_cached_scriptbook(group_root, track_names)
+    if scriptbook is not None:
+        _total = sum(len(v) for v in scriptbook.values())
+        _matched = sum(1 for v in scriptbook.values() if v)
+        if _total == 0 or _matched / max(len(scriptbook), 1) < 0.3:
+            scriptbook = None
+    if scriptbook is None:
+        scriptbook = _load_scriptbook(group_root, ctx, track_names, samples or None)
+    terms, alias_list, worldview = _analyze_work_terms(group_root, ctx)
+    for jp, zh in load_terms_from_config(ctx.config).items():
+        terms.setdefault(jp, zh)
+    return scriptbook, terms, alias_list, worldview
+
+
+def _translate_task_stream(ctx: PipelineContext, task: dict) -> bool:
+    """流式路径的单音轨任务：复用 translate_one_lrc，失败进现有重试队列。"""
+    from engines.api_client import worker_local, start_track_buffer, stop_track_buffer
+    name = threading.current_thread().name
+    m = re.search(r'ThreadPoolExecutor-\d+_(\d+)', name)
+    worker_local._worker_id = int(m.group(1)) if m else 0
+    lrc_path = task['lrc_path']
+    label = task.get('label', '')
+    attempts = int(task.get('attempts', 0) or 0)
+    start_track_buffer()
+    try:
+        _log(f"\n  ▶ 开始音轨: {label} | {lrc_path.name}", console=True)
+        return translate_one_lrc(
+            lrc_path, ctx,
+            terms=task.get('terms'),
+            alias_list=task.get('alias_list'),
+            worldview=task.get('worldview'),
+            scriptbook_lines=task.get('scriptbook_lines'),
+            attempts=attempts,
+            label=label,
+            wkey=task.get('wkey') or '',
+            source_path=task.get('source_path'),
+            target_path=lrc_path,
+        )
+    except Exception as e:
+        _log(f"  [异常] {lrc_path.name}: {e}", console=True)
+        if attempts < ctx.max_failed_retries:
+            _enqueue_failed_track(ctx, task, f"[异常] {e}")
+        return False
+    finally:
+        try:
+            stop_track_buffer()
+        except Exception:
+            pass
+
+
+def _process_work_stream(ctx: PipelineContext, wkey: str, pool, windows) -> None:
+    """单作品：分析 → 提交音轨任务 → 等待本作品完成 → 关闭进度窗。"""
+    group_root = Path(wkey)
+    targets, sources, _audios = _collect_translation_pairs(group_root, ctx)
+    if not targets:
+        return
+    windows.open(wkey, _work_label(wkey))
+    try:
+        scriptbook, terms, alias_list, worldview = _analyze_group_stream(ctx, wkey, targets)
+        label = _work_label(wkey)
+        with ctx.thread_lock:
+            ctx.work_expected_counts[wkey] = len(targets)
+        futures = []
+        for t in targets:
+            sb = None
+            if scriptbook:
+                sb = scriptbook.get(_track_key(group_root, t)) or scriptbook.get(t.stem)
+            task = {
+                'lrc_path': t,
+                'source_path': sources.get(t, t),
+                'label': label,
+                'wkey': wkey,
+                'terms': terms,
+                'alias_list': alias_list,
+                'worldview': worldview,
+                'scriptbook_lines': sb,
+                'attempts': 0,
+            }
+            futures.append(pool.submit(_translate_task_stream, ctx, task))
+        for fut in futures:
+            try:
+                fut.result()
+            except Exception:
+                pass
+    finally:
+        windows.close(wkey)
+
+
+def _run_streaming_pipeline(roots, ctx: PipelineContext) -> dict:
+    """转录与翻译交叠执行：某作品转录完立即分析并翻译，不等整批。
+
+    roots 支持单个目录或目录列表；多个根目录共享同一个线程池与并发上限。
+    """
+    if isinstance(roots, (str, Path)):
+        roots = [Path(roots)]
+    roots = [Path(r) for r in roots]
+    import queue as _queue
+    from concurrent.futures import ThreadPoolExecutor
+    from pipeline.work_windows import WorkWindowManager
+
+    _print_api_config(ctx)
+    ready_q: _queue.Queue = _queue.Queue()
+    tx_done = threading.Event()
+
+    def _on_ready(wkey: str) -> None:
+        ready_q.put(wkey)
+
+    def _run_tx() -> None:
+        try:
+            for r in roots:
+                _run_transcription_if_needed(r, ctx, on_group_ready=_on_ready)
+        finally:
+            tx_done.set()
+
+    tx_thread = threading.Thread(target=_run_tx, name='hdeg-transcribe', daemon=True)
+    tx_thread.start()
+
+    # 预检放在转录启动之后：即使 API 不可用，也让本地转录跑完
+    if ctx.config.get('app', {}).get('api_preflight', True):
+        try:
+            _preflight_api_check(ctx)
+        except SystemExit:
+            tx_thread.join()
+            raise
+
+    _wait_for_offpeak_if_needed(ctx)
+
+    windows = WorkWindowManager(ctx.work_progress_windows)
+    slots = threading.Semaphore(ctx.parallel_works)
+    pool = ThreadPoolExecutor(max_workers=max(1, ctx.translation_parallel))
+    dispatched: set[str] = set()
+    group_threads: list[threading.Thread] = []
+
+    def _start(wkey: str) -> None:
+        if wkey in dispatched:
+            return
+        dispatched.add(wkey)
+
+        def _worker() -> None:
+            slots.acquire()
+            try:
+                _process_work_stream(ctx, wkey, pool, windows)
+            finally:
+                slots.release()
+
+        th = threading.Thread(target=_worker, name=f'hdeg-work-{len(group_threads)}', daemon=True)
+        th.start()
+        group_threads.append(th)
+
+    def _group_of(path: Path) -> str:
+        rj_root, _ = find_rj_work_root(path)
+        return str(rj_root) if rj_root else str(path.parent)
+
+    # 初始：没有任何待转录音频的作品立即可派
+    pending_groups = set()
+    initial_pairs: list[Path] = []
+    for _r in roots:
+        pending_groups |= _groups_with_pending_audio(_r, ctx)
+        _pairs, _, _ = _collect_translation_pairs(_r, ctx)
+        initial_pairs.extend(_pairs)
+    for t in initial_pairs:
+        wkey = _group_of(t)
+        if wkey not in pending_groups:
+            _start(wkey)
+
+    # 流转：某作品组转录全部写完 → 立即派发
+    while not tx_done.is_set() or not ready_q.empty():
+        try:
+            wkey = ready_q.get(timeout=0.5)
+        except _queue.Empty:
+            continue
+        _start(wkey)
+
+    tx_thread.join()
+
+    # 收尾：补派漏网作品（转录失败但已有 .ja、或回调丢失）
+    final_pairs: list[Path] = []
+    for _r in roots:
+        _pairs, _, _ = _collect_translation_pairs(_r, ctx)
+        final_pairs.extend(_pairs)
+    for t in final_pairs:
+        _start(_group_of(t))
+
+    for th in group_threads:
+        th.join()
+    pool.shutdown(wait=True)
+
+    # 失败音轨重试（与整批路径同一套队列）
+    for _round in range(1, ctx.max_failed_retries + 1):
+        with ctx.thread_lock:
+            retry_tasks = list(ctx.retry_queue)
+            ctx.retry_queue = []
+        if not retry_tasks:
+            break
+        for t in retry_tasks:
+            t['attempts'] = int(t.get('attempts', 0) or 0) + 1
+        _log(f"\n  [重试] 第 {_round} 轮，{len(retry_tasks)} 个音轨", console=True)
+        with ThreadPoolExecutor(max_workers=min(ctx.translation_parallel, len(retry_tasks))) as ex:
+            list(ex.map(lambda t: _translate_task_stream(ctx, t), retry_tasks))
+
+    windows.close_all()
+    _log(f"\n[完成] 翻译 {ctx.stats.get('translated', 0)} 个音轨，"
+         f"跳过 {ctx.stats.get('skipped', 0)} 个", console=True)
+    try:
+        ctx.pr.token_summary(ctx.tracker)
+    except Exception:
+        pass
+    return ctx.stats
+
+
 def run_pipeline(
     root: Path,
     *,
@@ -2696,7 +3153,19 @@ def run_pipeline(
     sys.stderr.flush()
 
     ctx = PipelineContext(config_path)
+    _roots = [Path(r) for r in (root if isinstance(root, (list, tuple)) else [root])]
+    root = _roots[0]
     root_abs = root.absolute()
+
+    # 多根目录：流式模式下共享同一线程池并发推进；非流式逐目录串行
+    if len(_roots) > 1:
+        _mode = ctx.config.get('app', {}).get('translation_mode', 'per_track')
+        if ctx.stream_workflow and _mode != 'all_at_once':
+            return _run_streaming_pipeline(_roots, ctx)
+        _last: dict = {}
+        for _r in _roots:
+            _last = run_pipeline(_r, config_path=config_path, use_gpu=use_gpu)
+        return _last
 
     # 设置模块级 printer，使 _debug() 可以工作
     global _pr
@@ -2738,17 +3207,17 @@ def run_pipeline(
         # 仅运行转录（infer.exe），然后直接返回
         _run_transcription_if_needed(root, ctx)
 
-        # 扫描生成的字幕文件，报告结果
-        lrc_files, ja_files, archived, file_groups = scan_subtitle_files(root)
-        ctx.stats['archived'] = archived
-        _log(f"\n[完成] 本地模型处理完毕，共生成 {len(lrc_files)} 个字幕文件")
-        for ext in ('.lrc', '.srt', '.vtt'):
-            count = sum(1 for f in lrc_files if f.suffix == ext)
-            if count:
-                _log(f"  {ext}: {count} 个")
+        # 扫描生成的字幕文件，报告结果（转录产物为 .ja.lrc）
+        lrc_files, ja_files, _archived, file_groups = scan_subtitle_files(root)
+        _log(f"\n[完成] 本地模型处理完毕，共生成 {len(ja_files)} 个日文留档")
         return ctx.stats
 
     # ──── 第 0 步: 语音转录（infer.exe）──
+    _translation_mode = ctx.config.get('app', {}).get('translation_mode', 'per_track')
+    if ctx.stream_workflow and _translation_mode != 'all_at_once':
+        # 流式：转录期间作品组一就绪就立即分析与翻译
+        return _run_streaming_pipeline(root, ctx)
+
     _run_transcription_if_needed(root, ctx)
     _log()
 
@@ -2767,17 +3236,18 @@ def run_pipeline(
     ctx.stats['archived'] = archived
 
     # 翻译仅处理 LRC 文件，SRT/VTT 在翻译完成后从 LRC 结果同步
-    srt_vtt_files = [f for f in lrc_files if f.suffix in ('.srt', '.vtt')]
-    lrc_files = [f for f in lrc_files if f.suffix == '.lrc']
+    _scan_srt_vtt = [f for f in lrc_files if f.suffix in ('.srt', '.vtt')]
+    if _scan_srt_vtt:
+        _log(f"\n[字幕] 发现 {len(_scan_srt_vtt)} 个 SRT/VTT 文件（不参与翻译，翻译完成后同步）")
 
-    if srt_vtt_files:
-        _log(f"\n[字幕] 发现 {len(srt_vtt_files)} 个 SRT/VTT 文件（不参与翻译，翻译完成后同步）")
+    # ── 逐文件判定：只看 A.lrc 是否存在 ──
+    lrc_files, source_map, audio_map = _collect_translation_pairs(root, ctx)
+    if lrc_files:
+        _log(f"  → 待翻译音轨: {len(lrc_files)} 个（源为 .ja.lrc）")
     _log()
 
     if not lrc_files:
-        _log("未发现 LRC 字幕文件，无需翻译")
-        if ja_lrc_files:
-            _log(f"  (有 {len(ja_lrc_files)} 个 .ja.lrc 留档文件，但无对应 .lrc)")
+        _log("没有待翻译的音轨（A.lrc 均已存在或无日文字幕）")
         return ctx.stats
 
     # ──── 文本分析（仅 debug 模式）──
@@ -2785,7 +3255,7 @@ def run_pipeline(
         all_texts = []
         for lrc_path in lrc_files:
             try:
-                sub_file = parse_subtitle_file(lrc_path)
+                sub_file = parse_subtitle_file(source_map.get(lrc_path, lrc_path))
                 if sub_file:
                     all_texts.extend([t for t in sub_file.original_lyrics if t.strip()])
             except Exception:
@@ -2828,7 +3298,8 @@ def run_pipeline(
                 _rj_root, _ = find_rj_work_root(_fp)
                 _gk = _rj_root if _rj_root else _fp.parent
                 if str(_gk) == _dir_key:
-                    _dir_track_names.append(_fp.stem)
+                    # 用作品内相对路径做键：同目录下不同子目录的同名音轨互不覆盖
+                    _dir_track_names.append(_track_key(group_key, _fp))
         _dir_track_samples = _extract_track_asr_samples(group_key, _dir_track_names)
         _groups_to_analyze.append((group_key, rj_number, _dir_track_names, _dir_track_samples))
 
@@ -2936,42 +3407,11 @@ def run_pipeline(
     # ──── 第 5 步: 翻译 ────
     translation_mode = ctx.config.get('app', {}).get('translation_mode', 'per_track')
 
-    # 过滤已翻译文件（参照 translate.py 的 process_all_lrc 逻辑）
-    # 关键：不能只看 .ja.lrc 是否存在（转录也会产生 .ja.lrc），
-    # 必须检测 .lrc 文件内容的实际语言
-    from io_adapter.lrc_handler import detect_lrc_language  # 已从 translate.py 迁移过来
-    skip_translated = ctx.config.get('app', {}).get('skip_translated', True)
-    if skip_translated:
-        skipped = 0
-        remaining: list[Path] = []
-        for f in lrc_files:
-            ext = f.suffix
-            ja_path = f.parent / f"{f.stem}.ja{ext}"
-            if ja_path.exists():
-                # .ja.lrc 存在 + .lrc 内容已变成中文 → 确实翻译过
-                lang = detect_lrc_language(f)
-                if lang == 'chinese':
-                    _debug(f"已翻译: {f.name}")
-                    ctx.stats['skipped'] += 1
-                    skipped += 1
-                    continue
-                # .ja.lrc 存在但 .lrc 仍是日文 → 只转录未翻译，需要翻译
-            else:
-                # 没有 .ja.lrc 但 .lrc 已经是中文 → 翻译过但留档丢失，跳过
-                lang = detect_lrc_language(f)
-                if lang == 'chinese':
-                    _debug(f"已翻译(无留档): {f.name}")
-                    ctx.stats['skipped'] += 1
-                    skipped += 1
-                    continue
-            remaining.append(f)
-        if skipped > 0:
-            _log(f"  → 跳过 {skipped} 个已翻译文件, 剩余 {len(remaining)} 个")
-            new_groups: dict = {}
-            for f in remaining:
-                new_groups.setdefault(f.parent, []).append(f)
-            file_groups = new_groups
-        lrc_files = remaining
+    # 待翻译任务已由 _collect_translation_pairs 按「A.lrc 存在即完成」过滤，
+    # 这里只按目录重建分组（all_at_once 模式使用）
+    file_groups = {}
+    for _f in lrc_files:
+        file_groups.setdefault(_f.parent, []).append(_f)
 
     _sep(f"第 3 步: 翻译（模式: {translation_mode}）")
     _log(f"待处理文件: {len(lrc_files)} 个\n")
@@ -2987,7 +3427,7 @@ def run_pipeline(
             # 收集文件数据
             files_data = []
             for fpath in dir_files:
-                sub_file = parse_subtitle_file(fpath)
+                sub_file = parse_subtitle_file(source_map.get(fpath, fpath))
                 if sub_file is None:
                     continue
                 files_data.append({
@@ -3113,6 +3553,8 @@ def run_pipeline(
                         attempts=_attempts,
                         label=label,
                         wkey=task.get('wkey') or '',
+                        source_path=task.get('source_path'),
+                        target_path=lrc_path,
                     )
                     _elapsed = time.time() - _start
                     # 先落本次结论，再判定状态：重试成功必须先覆盖首轮的“失败”标记，
@@ -3229,9 +3671,12 @@ def run_pipeline(
                 alias_list = work_alias.get(wkey, [])
                 scriptbook_map = work_scriptbook.get(wkey, None)
                 worldview = work_worldview.get(wkey, None)
+                _tkey = _track_key(Path(wkey), lrc_path)
                 sb_lines = None
                 if scriptbook_map:
-                    sb_lines = scriptbook_map.get(lrc_path.stem, None)
+                    sb_lines = scriptbook_map.get(_tkey, None)
+                    if not sb_lines:
+                        sb_lines = scriptbook_map.get(lrc_path.stem, None)
                     if not sb_lines:
                         for _sb_name, _sb_lines in scriptbook_map.items():
                             if _sb_lines and (lrc_path.stem in _sb_name or _sb_name in lrc_path.stem):
@@ -3239,6 +3684,7 @@ def run_pipeline(
                                 break
                 _tasks.append({
                     'lrc_path': lrc_path,
+                    'source_path': source_map.get(lrc_path, lrc_path),
                     'label': label,
                     'wkey': wkey,
                     'terms': terms,
@@ -3378,7 +3824,9 @@ def run_pipeline(
 
                 from engines.api_client import start_track_buffer as _stb, stop_track_buffer as _spb
                 _dir_key = str(_effective_dir)
-                _s_track = {'lrc_path': lrc_path, 'label': '', 'wkey': _dir_key, 'attempts': 0}
+                _s_track = {'lrc_path': lrc_path,
+                            'source_path': source_map.get(lrc_path, lrc_path),
+                            'label': '', 'wkey': _dir_key, 'attempts': 0}
                 _s_status = '跳过'
                 _s_reason = ''
                 _s_elapsed = 0.0
@@ -3393,7 +3841,9 @@ def run_pipeline(
                         _dir_worldview = work_worldview.get(_dir_key, None)
                         _track_sb_lines = None
                         if _dir_scriptbook_map:
-                            _track_sb_lines = _dir_scriptbook_map.get(lrc_path.stem, None)
+                            _track_sb_lines = _dir_scriptbook_map.get(_track_key(_effective_dir, lrc_path), None)
+                            if not _track_sb_lines:
+                                _track_sb_lines = _dir_scriptbook_map.get(lrc_path.stem, None)
                             if not _track_sb_lines:
                                 for _sb_name, _sb_lines in _dir_scriptbook_map.items():
                                     if _sb_lines and (lrc_path.stem in _sb_name or _sb_name in lrc_path.stem):
@@ -3407,6 +3857,8 @@ def run_pipeline(
                             scriptbook_lines=_track_sb_lines,
                             attempts=0,
                             wkey=_dir_key,
+                            source_path=source_map.get(lrc_path, lrc_path),
+                            target_path=lrc_path,
                         )
                         _s_elapsed = time.time() - _s_t0
                         if success:
@@ -3507,6 +3959,8 @@ def run_pipeline(
                                 attempts=_rt.get('attempts', _round_s),
                                 label=_rt.get('label', ''),
                                 wkey=_rt_wkey,
+                                source_path=_rt.get('source_path'),
+                                target_path=_rt['lrc_path'],
                             )
                             _r_elapsed = time.time() - _r_t0
                             if _rsuccess:

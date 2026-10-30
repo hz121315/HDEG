@@ -11,6 +11,7 @@
 """
 
 from __future__ import annotations
+import os
 import re
 from pathlib import Path
 from dataclasses import dataclass
@@ -341,6 +342,29 @@ def parse_subtitle_file(path: Path) -> SubtitleFile | None:
     )
 
 
+def _atomic_write_lines(lines: list[str], target_path: Path) -> None:
+    """原子写字幕文件：同目录临时文件 + os.replace。
+
+    进程在写回中途被杀时，磁盘上只会保留完整的旧文件或完整的新文件，
+    不会出现截断的半截字幕（断点续跑的可靠性依赖这一点）。
+    """
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = target_path.with_name(f'.{target_path.name}.hdeg-tmp')
+    try:
+        with open(tmp_path, 'w', encoding='utf-8') as f:
+            f.writelines(lines)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, target_path)
+    except Exception:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def write_subtitle_file(sub_file: SubtitleFile, translated_lyrics: list[str], target_path: Path) -> None:
     """将翻译结果写回字幕文件（保留原始结构）
 
@@ -360,9 +384,7 @@ def write_subtitle_file(sub_file: SubtitleFile, translated_lyrics: list[str], ta
     # None 占位转空行
     final_lines = [line if line is not None else '\n' for line in final_lines]
 
-    target_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(target_path, 'w', encoding='utf-8') as f:
-        f.writelines(final_lines)
+    _atomic_write_lines(final_lines, target_path)
 
 
 def write_subtitle_file_nonempty(sub_file: SubtitleFile, translated_lyrics: list[str], target_path: Path) -> None:
@@ -395,9 +417,80 @@ def write_subtitle_file_nonempty(sub_file: SubtitleFile, translated_lyrics: list
     # 删除空歌词行（final_lines 中仍为 None 的行）
     out_lines = [l if l is not None else '\n' for l in final_lines if l is not None]
 
-    target_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(target_path, 'w', encoding='utf-8') as f:
-        f.writelines(out_lines)
+    _atomic_write_lines(out_lines, target_path)
+
+
+# ==================== LRC → SRT / VTT 生成 ====================
+
+def _lrc_time_to_seconds(tags: str) -> float | None:
+    """从 LRC 时间标签串（可能含多个标签）取第一个时间，转成秒。"""
+    if not tags:
+        return None
+    m = LRC_TIME_PATTERN.search(tags)
+    if not m:
+        return None
+    body = m.group(0)[1:-1]          # mm:ss.xx
+    try:
+        mm, ss = body.split(':', 1)
+        return int(mm) * 60 + float(ss)
+    except (ValueError, TypeError):
+        return None
+
+
+def _fmt_srt_time(sec: float) -> str:
+    ms = int(round(max(sec, 0.0) * 1000))
+    h, ms = divmod(ms, 3600000)
+    m, ms = divmod(ms, 60000)
+    s, ms = divmod(ms, 1000)
+    return f'{h:02d}:{m:02d}:{s:02d},{ms:03d}'
+
+
+def _fmt_vtt_time(sec: float) -> str:
+    return _fmt_srt_time(sec).replace(',', '.')
+
+
+def _lrc_cues(lrc_path: Path) -> list[tuple[float, str]]:
+    """读出字幕的 (起始秒, 文本) 序列；SRT/VTT 生成共用。"""
+    sub = parse_subtitle_file(lrc_path)
+    if sub is None:
+        return []
+    cues: list[tuple[float, str]] = []
+    for tags, text in zip(sub.time_tags, sub.original_lyrics):
+        start = _lrc_time_to_seconds(tags)
+        if start is None:
+            continue
+        cues.append((start, text or ''))
+    return cues
+
+
+def write_srt_from_lrc(lrc_path: Path, target_path: Path) -> bool:
+    """按 LRC 时间轴生成 SRT（结束时间取下一行起点，末行 +2 秒）。"""
+    cues = _lrc_cues(lrc_path)
+    if not cues:
+        return False
+    out: list[str] = []
+    for i, (start, text) in enumerate(cues):
+        end = cues[i + 1][0] if i + 1 < len(cues) else start + 2.0
+        if end <= start:
+            end = start + 0.5
+        out.append(f'{i + 1}\n{_fmt_srt_time(start)} --> {_fmt_srt_time(end)}\n{text}\n\n')
+    _atomic_write_lines(out, target_path)
+    return True
+
+
+def write_vtt_from_lrc(lrc_path: Path, target_path: Path) -> bool:
+    """按 LRC 时间轴生成 VTT。"""
+    cues = _lrc_cues(lrc_path)
+    if not cues:
+        return False
+    out: list[str] = ['WEBVTT\n\n']
+    for i, (start, text) in enumerate(cues):
+        end = cues[i + 1][0] if i + 1 < len(cues) else start + 2.0
+        if end <= start:
+            end = start + 0.5
+        out.append(f'{_fmt_vtt_time(start)} --> {_fmt_vtt_time(end)}\n{text}\n\n')
+    _atomic_write_lines(out, target_path)
+    return True
 
 
 # ==================== 语言检测 ====================

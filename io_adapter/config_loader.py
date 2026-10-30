@@ -63,6 +63,17 @@ def load_config(path: Path = None) -> dict[str, Any]:
             "save_track_logs": True,
             "track_log_detail": True,
             "api_preflight": True,
+            # ── 流水线（转录与翻译交叠执行）──
+            "stream_workflow": True,
+            "transcribe_settle_seconds": 2.0,
+            "transcribe_poll_interval": 0.5,
+            "parallel_works": 10,
+            "work_progress_windows": True,
+            # ── 作品识别与逐文件判定 ──
+            "rj_lookup_depth": 4,
+            "skip_hanhua_files": False,
+            "srt_vtt_resync": True,
+            "lrc_max_lines_per_request": 100,
         },
         "pricing": {"hit_per_1m": 0.02, "miss_per_1m": 1, "completion_per_1m": 2},
         "network": {"clear_proxy_on_startup": False},

@@ -330,14 +330,6 @@ echo [0/2] 准备转录标记...
 set "has_ja_lrc=0"
 for /f "delims=" %%f in ('dir /s /b "!src_dir!\\*.ja.lrc" 2^>nul') do (
     set "has_ja_lrc=1"
-    set "ja_name=%%~nf"
-    set "ja_dir=%%~dpf"
-    set "base_name=!ja_name:~0,-3!"
-    set "lrc_path=!ja_dir!!base_name!.lrc"
-    if not exist "!lrc_path!" (
-        copy "%%f" "!lrc_path!" >nul
-        echo   恢复: !base_name!.lrc (从 .ja.lrc)
-    )
 )
 
 echo [0/2] 准备完成。
@@ -393,7 +385,13 @@ echo.
 
 :translate
 echo [2/2] 正在启动翻译...（自动处理留档和去重）
-> "%cpath%\\input_path.txt" echo(!src_dir!
+> "%cpath%\\input_path.txt" (
+    if "%~1"=="" (
+        echo !src_dir!
+    ) else (
+        for %%a in (%*) do echo %%~fa
+    )
+)
 
 :: 读取 config.json 中的 main_exe，为空则默认同目录下的 main.exe
 set "main_exe="

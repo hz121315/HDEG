@@ -119,6 +119,15 @@ HDEG 不绑定单一厂商。模型行为由 `config.json → api.models` 注册
    └──────────────────────────────────────────────────────────────┘
 ```
 
+### 流水线与断点
+
+- **逐文件判定只看 `A.lrc`**：`A.lrc` 存在即视为已完成跳过；没有 `A.lrc` 但有 `A.ja.lrc` 时直接以 `.ja.lrc` 为源翻译；两者都没有才调用 infer 转录。
+- **转录与翻译交叠**（`app.stream_workflow`，默认开）：某个作品的音频转录完成后，立即进入台本/术语分析与翻译，不等整批转录结束。单进程实现，翻译 worker 在后台线程运行，每个作品可开一个最小化进度窗口（`app.work_progress_windows`），同时翻译的作品数由 `app.parallel_works` 限制。
+- **转录实时留存**：转录期间按文件 size+mtime 判定写稳，立即归档为 `A.ja.lrc` 并删除 `A.lrc`，因此 `A.lrc` 只在翻译成功后才出现。
+- **翻译原子写**：写回使用临时文件 + `os.replace`，进程被杀只会留下完整旧文件或完整新文件；已完成的音轨下次运行自动跳过。
+- **视频作品**：`app.srt_vtt_resync` 开启时按 LRC 时间轴额外生成同名 `.srt`/`.vtt`。
+
+
 ---
 
 ## 五、快速开始（源码 / 开发）
@@ -146,7 +155,19 @@ python main.py <作品目录>
     }
   },
   "transcription": { "infer_exe": "./infer.exe", "model_dir": "./models" },
-  "app": { "print_worker_detail": false, "debug": false }
+  "app": {
+    "print_worker_detail": false, "debug": false,
+    // 流水线与逐文件判定
+    "stream_workflow": true,          // 转录完一部作品立即翻译
+    "transcribe_settle_seconds": 2.0, // 判定 .lrc 写稳的静默期
+    "transcribe_poll_interval": 0.5,
+    "parallel_works": 10,             // 同时翻译的作品数上限
+    "work_progress_windows": true,    // 每作品一个最小化进度窗
+    "rj_lookup_depth": 4,             // RJ 号向上查找层数
+    "skip_hanhua_files": false,       // 跳过「汉化/漢化」结尾的音频
+    "srt_vtt_resync": true,           // 视频作品生成 srt/vtt
+    "lrc_max_lines_per_request": 100  // 0 = 整文件一次
+  }
 }
 ```
 
