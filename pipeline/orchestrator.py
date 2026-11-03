@@ -2679,8 +2679,15 @@ def _run_transcription_if_needed(work_dir: Path, ctx: PipelineContext,
         f'--device={device}',
         f'--task=transcribe',
         f'--compute_type={compute_type}',
-        str(work_dir),
     ]
+    # 透传额外参数（如 --enable_batching / --batch_size=30 / --smart_split_with_vad=false）
+    _extra_args = tc.get('extra_args') or []
+    if isinstance(_extra_args, str):
+        _extra_args = _extra_args.split()
+    for _a in _extra_args:
+        if str(_a).strip():
+            cmd.append(str(_a))
+    cmd.append(str(work_dir))
 
     _log(f"[转录] {' '.join(cmd)}")
     _log()

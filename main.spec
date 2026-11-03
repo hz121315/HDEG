@@ -3,8 +3,8 @@ from PyInstaller.utils.hooks import collect_data_files
 from PyInstaller.utils.hooks import collect_submodules
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('D:\\anaconda_2022\\lib\\site-packages\\fugashi.libs\\.load-order-fugashi-1.5.2', 'fugashi.libs'), ('D:\\anaconda_2022\\lib\\site-packages\\pyopenjtalk\\open_jtalk_dic_utf_8-1.11', 'pyopenjtalk/open_jtalk_dic_utf_8-1.11')]
-binaries = [('D:\\anaconda_2022\\lib\\site-packages\\fugashi.libs\\libmecab-d8ddc0791437ce8c4a187ae7c69a2f68.dll', 'fugashi.libs')]
+datas = [('C:/Users/Administrator/IdeaProjects/HDEG/.venv/lib/site-packages/pyopenjtalk/open_jtalk_dic_utf_8-1.11', 'pyopenjtalk/open_jtalk_dic_utf_8-1.11')]
+binaries = [('C:/Users/Administrator/IdeaProjects/HDEG/.venv/lib/site-packages/fugashi.libs/libmecab-d8ddc0791437ce8c4a187ae7c69a2f68.dll', 'fugashi.libs')]
 hiddenimports = []
 datas += collect_data_files('unidic_lite')
 datas += collect_data_files('fitz')
