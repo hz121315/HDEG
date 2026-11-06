@@ -868,6 +868,22 @@ def _track_key(work_root: Path, path: Path) -> str:
 _DEFAULT_AUDIO_SUFFIXES = 'mp3,wav,flac,m4a,aac,ogg,wma,mp4,mkv,avi,mov,webm,flv,wmv'
 
 
+def _detect_gpu_vram_gb() -> float | None:
+    """读取显卡总显存（GB）；无 nvidia-smi 或非 NVIDIA 环境返回 None。"""
+    import subprocess
+    try:
+        r = subprocess.run(
+            ['nvidia-smi', '--query-gpu=memory.total', '--format=csv,noheader,nounits'],
+            capture_output=True, text=True, timeout=10
+        )
+        first = (r.stdout or '').strip().splitlines()
+        if first:
+            return round(float(first[0].strip()) / 1024.0, 1)
+    except Exception:
+        pass
+    return None
+
+
 def _audio_exts_from_config(ctx: PipelineContext) -> set[str]:
     """从 transcription.audio_suffixes 得到音频扩展名集合（带点的形式）。
 
@@ -2596,18 +2612,25 @@ def _run_transcription_if_needed(work_dir: Path, ctx: PipelineContext,
         _log(f"[转录] infer.exe 不存在: {exe_path}，跳过转录步骤")
         return
 
-    # 检测 RTX 50 系列 GPU，自动切换 compute_type 为 float16
-    try:
-        result = subprocess.run(
-            ['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'],
-            capture_output=True, text=True, timeout=10
-        )
-        import re
-        if re.search(r'RTX\s*50\d\d', result.stdout):
+    # 按显存自动调参：显存足够时用 float16 + 批处理，尽量吃满 GPU 而不是逐句解码。
+    # 只在 CUDA 且能读到显存时生效；auto_tune=false 或显式给了 extra_args 时以配置为准。
+    auto_tune = bool(tc.get('auto_tune', True))
+    auto_args: list[str] = []
+    vram_gb = _detect_gpu_vram_gb() if (auto_tune and str(device).lower().startswith('cuda')) else None
+    if vram_gb:
+        if vram_gb >= 10:
             compute_type = 'float16'
-            _log(f"[转录] 检测到 RTX 50 系列 GPU，自动切换 compute_type 为 float16")
-    except Exception:
-        pass
+        if vram_gb >= 14:
+            _batch = 32
+        elif vram_gb >= 10:
+            _batch = 24
+        elif vram_gb >= 7:
+            _batch = 16
+        else:
+            _batch = 8
+        auto_args = ['--enable_batching', f'--batch_size={_batch}', '--smart_split_with_vad=false']
+        _log(f"[转录] 显存 {vram_gb:.0f}GB → compute_type={compute_type}, "
+             f"batching 开启, batch_size={_batch}")
 
     _sep("第 0 步: 语音转录 (infer.exe)")
     _log(f"[转录] 引擎: {exe_path}")
@@ -2680,13 +2703,13 @@ def _run_transcription_if_needed(work_dir: Path, ctx: PipelineContext,
         f'--task=transcribe',
         f'--compute_type={compute_type}',
     ]
-    # 透传额外参数（如 --enable_batching / --batch_size=30 / --smart_split_with_vad=false）
+    # 透传额外参数：用户显式配置优先，否则用按显存自动推导出来的批处理参数
     _extra_args = tc.get('extra_args') or []
     if isinstance(_extra_args, str):
         _extra_args = _extra_args.split()
-    for _a in _extra_args:
-        if str(_a).strip():
-            cmd.append(str(_a))
+    _extra_args = [str(_a) for _a in _extra_args if str(_a).strip()]
+    for _a in (_extra_args or auto_args):
+        cmd.append(_a)
     cmd.append(str(work_dir))
 
     _log(f"[转录] {' '.join(cmd)}")

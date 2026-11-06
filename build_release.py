@@ -324,67 +324,12 @@ echo ========================================
 echo 工作目录: !src_dir!
 echo ========================================
 echo.
-
-echo [0/2] 准备转录标记...
-
-set "has_ja_lrc=0"
-for /f "delims=" %%f in ('dir /s /b "!src_dir!\\*.ja.lrc" 2^>nul') do (
-    set "has_ja_lrc=1"
-)
-
-echo [0/2] 准备完成。
+echo [1/2] 转录与翻译由 main.exe 统一执行（参数见 config.json → transcription）
 echo.
-
-set "need_transcribe=0"
-set "audio_extensions=.mp3 .wav .flac .m4a .aac .ogg .wma .mp4 .mkv .avi .mov .webm .flv .wmv"
-
-for %%e in (%audio_extensions%) do (
-    for /f "delims=" %%a in ('dir /s /b "!src_dir!\\*%%e" 2^>nul') do (
-        set "audio_name=%%~na"
-        set "audio_dir=%%~dpa"
-        set "ja_lrc_path=!audio_dir!!audio_name!.ja.lrc"
-        if not exist "!ja_lrc_path!" set "need_transcribe=1"
-    )
-)
-
-if "!need_transcribe!"=="0" (
-    echo [1/2] 检测到所有音频已有 .ja.lrc 留档，跳过转录。
-    echo.
-    goto :translate
-)
 '''
 
-    MID_START = 'echo [1/2] 正在执行日文转录'
-    MID_END = '''"%cpath%\\infer.exe" ^'''
-
     TAIL = '''
-if errorlevel 1 (
-    echo [错误] 转录过程出错。
-    pause
-    exit /b 1
-)
-
-echo [1/2] 转录阶段结束，正在留档日文歌词...
-
-for %%e in (%audio_extensions%) do (
-    for /f "delims=" %%a in ('dir /s /b "!src_dir!\\*%%e" 2^>nul') do (
-        set "audio_dir=%%~dpa"
-        set "audio_name=%%~na"
-        set "lrc_path=!audio_dir!!audio_name!.lrc"
-        set "ja_lrc_path=!audio_dir!!audio_name!.ja.lrc"
-        if exist "!lrc_path!" (
-            if not exist "!ja_lrc_path!" (
-                copy "!lrc_path!" "!ja_lrc_path!" >nul
-                echo   留档: !audio_name!.ja.lrc
-            )
-        )
-    )
-)
-
-echo.
-
-:translate
-echo [2/2] 正在启动翻译...（自动处理留档和去重）
+echo [2/2] 正在启动转录+翻译流水线...
 > "%cpath%\\input_path.txt" (
     if "%~1"=="" (
         echo !src_dir!
@@ -433,40 +378,27 @@ pause'''
         "Hde鸡-翻译(GPU).bat": {
             "desc": "GPU 转录 + 翻译",
             "title": "HDE G 翻译 (GPU)",
-            "mid": MID_START + '（GPU模式）...\necho     已存在同名 .lrc 的音频将自动跳过...\necho.\n\n'
-                   + MID_END + '\n    --audio_suffixes="mp3,wav,flac,m4a,aac,ogg,wma,mp4,mkv,avi,mov,webm,flv,wmv" ^\n'
-                   + '    --sub_formats="lrc" ^\n    --device="cuda" ^\n    --task="transcribe" ^\n    "!src_dir!"',
+            "mid": 'echo   mode: GPU（device/compute_type 以 config.json 为准）\necho.\n\n',
         },
         "Hde鸡-翻译(CPU).bat": {
             "desc": "CPU 转录 + 翻译",
             "title": "HDE G 翻译 (CPU)",
-            "mid": MID_START + '（CPU模式）...\necho     已存在同名 .lrc 的音频将自动跳过...\necho.\n\n'
-                   + MID_END + '\n    --audio_suffixes="mp3,wav,flac,m4a,aac,ogg,wma,mp4,mkv,avi,mov,webm,flv,wmv" ^\n'
-                   + '    --sub_formats="lrc" ^\n    --device="cpu" ^\n    --task="transcribe" ^\n    "!src_dir!"',
+            "mid": 'echo   mode: CPU（请在 config.json 设 transcription.device="cpu"）\necho.\n\n',
         },
         "Hde鸡-翻译(GPU,低显存模式).bat": {
             "desc": "GPU 低显存转录 + 翻译",
             "title": "HDE G 翻译 (GPU, 低显存)",
-            "mid": MID_START + '（GPU低显存模式）...\necho     已存在同名 .lrc 的音频将自动跳过...\necho.\n\n'
-                   + MID_END + '\n    --audio_suffixes="mp3,wav,flac,m4a,aac,ogg,wma,mp4,mkv,avi,mov,webm,flv,wmv" ^\n'
-                   + '    --sub_formats="lrc" ^\n    --device="cuda" ^\n    --compute_type="int8_float16" ^\n'
-                   + '    --task="transcribe" ^\n    "!src_dir!"',
+            "mid": 'echo   mode: GPU 低显存（config.json 设 compute_type="int8_float16"）\necho.\n\n',
         },
         "Hde鸡-翻译(GPU,高显存加速模式).bat": {
             "desc": "GPU 高显存批处理转录 + 翻译",
             "title": "HDE G 翻译 (GPU, 批处理加速)",
-            "mid": MID_START + '（GPU批处理加速模式）...\necho     自动检测最佳批处理大小以提高速度...\necho     需要更多显存 (建议8GB+)...\necho.\n\n'
-                   + MID_END + '\n    --audio_suffixes="mp3,wav,flac,m4a,aac,ogg,wma,mp4,mkv,avi,mov,webm,flv,wmv" ^\n'
-                   + '    --sub_formats="lrc" ^\n    --device="cuda" ^\n    --task="transcribe" ^\n'
-                   + '    --enable_batching --max_batch_size=8 ^\n    "!src_dir!"',
+            "mid": 'echo   mode: GPU 批处理加速（config.json 设 compute_type="float16"\necho   并在 transcription.extra_args 加 --enable_batching --batch_size=32）\necho.\n\n',
         },
         "Hde鸡-翻译(GPU)(输出到当前文件夹).bat": {
             "desc": "GPU 转录 + 翻译 (输出到源目录)",
             "title": "HDE G 翻译 (GPU, 输出到当前文件夹)",
-            "mid": MID_START + '（GPU模式, 输出到当前文件夹）...\necho     已存在同名 .lrc 的音频将自动跳过...\necho.\n\n'
-                   + MID_END + '\n    --audio_suffixes="mp3,wav,flac,m4a,aac,ogg,wma,mp4,mkv,avi,mov,webm,flv,wmv" ^\n'
-                   + '    --sub_formats="lrc" ^\n    --device="cuda" ^\n    --output_dir="输出" ^\n'
-                   + '    --task="transcribe" ^\n    "!src_dir!"',
+            "mid": 'echo   mode: 输出到源目录（字幕始终写在音频旁）\necho.\n\n',
         },
     }
 
