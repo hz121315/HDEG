@@ -539,6 +539,8 @@ def copy_config():
             "track_log_detail": True,
             "api_preflight": True,
             "print_worker_detail": True,
+            # NSFW 多级降级重试总开关（显式写入，用户可在发布件直接改 false 关闭）
+            "nsfw_fallback_enabled": True,
         }
         for k, v in defaults_app.items():
             if k not in config["app"]:
@@ -597,6 +599,19 @@ def copy_config():
         print("  设置默认: model=deepseek-flash, base_url=https://api.deepseek.com, "
               "active_preset=deepseek-official（用户仅需填 key）")
 
+        # 世界观和谐化专用 API 子段（空值 = 复用翻译 API；显式占位供用户填写）
+        if not isinstance(api.get("harmonize"), dict):
+            api["harmonize"] = {}
+        for _hk in ("key", "base_url", "model", "protocol"):
+            api["harmonize"].setdefault(_hk, "")
+        print("  补齐 api.harmonize 占位（空 = 复用翻译 API）")
+
+    # 和谐化自定义前置 prompt 文件路径（空 = 使用内置规则）
+    if not isinstance(config.get("prompts"), dict):
+        config["prompts"] = {}
+    config["prompts"].setdefault("harmonize_system_prompt_file", "")
+    print("  补齐 prompts.harmonize_system_prompt_file 占位")
+
     # 全局代理开关：发布件默认不强制清代理（交给 api.clear_proxy 与系统代理）
     if isinstance(config.get("network"), dict):
         config["network"]["clear_proxy_on_startup"] = False
@@ -615,6 +630,17 @@ def copy_config():
         config["transcription"]["infer_exe"] = ".\\infer.exe"
         config["transcription"]["model_dir"] = ".\\models"
         print(f"  更新转录配置: infer_exe -> .\\infer.exe, model_dir -> .\\models")
+
+        # 发布件默认高性能转录参数（目标机 9700x + 32G + 5070 Ti 完全够用）：
+        # float16 精度 + batching 32 + 关闭 VAD 逐句切分（长块整体解码）。
+        # 显式 extra_args 非空时运行时 auto_tune 自动参数让位，本配置即为最终生效值。
+        # 低显存机器改回 int8_float16 / 更小 batch 见《使用说明.md》。
+        config["transcription"]["compute_type"] = "float16"
+        config["transcription"]["extra_args"] = [
+            "--enable_batching", "--batch_size=32", "--smart_split_with_vad=false"
+        ]
+        print("  设置转录默认: compute_type=float16, "
+              "extra_args=[--enable_batching, --batch_size=32, --smart_split_with_vad=false]")
     
     with open(config_dst, 'w', encoding='utf-8') as f:
         json.dump(config, f, ensure_ascii=False, indent=2)

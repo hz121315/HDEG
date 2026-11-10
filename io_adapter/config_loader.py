@@ -74,6 +74,10 @@ def load_config(path: Path = None) -> dict[str, Any]:
             "skip_hanhua_files": False,
             "srt_vtt_resync": True,
             "lrc_max_lines_per_request": 100,
+            # ── NSFW 多级降级重试 ──
+            # 翻译被道德审查拦截（空白/拒绝）时逐级降级：完整上下文 → 和谐版世界观
+            # → 仅和谐版角色表 → 纯文本裸翻；仍失败则跳过该音轨
+            "nsfw_fallback_enabled": True,
         },
         "pricing": {"hit_per_1m": 0.02, "miss_per_1m": 1, "completion_per_1m": 2},
         "network": {"clear_proxy_on_startup": False},

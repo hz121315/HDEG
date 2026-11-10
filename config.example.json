@@ -5,6 +5,12 @@
     "model": "deepseek-v4-flash",
     "active_preset": "",
     "protocol": "",
+    "harmonize": {
+      "key": "",
+      "base_url": "",
+      "model": "",
+      "protocol": ""
+    },
     "models": {
       "muse-spark": {"protocol": "responses", "note": "Zen网关仅支持responses",
         "reasoning": {"style": "effort", "param": "reasoning.effort", "values": ["low", "high"]}},
@@ -164,10 +170,14 @@
     "main_exe": "",
     "model_dir": "./转录模型/models",
     "device": "cuda",
-    "compute_type": "int8_float16",
+    "compute_type": "float16",
     "audio_suffixes": "mp3,wav,flac,m4a,aac,ogg,wma,mp4,mkv,avi,mov,webm,flv,wmv",
     "sub_formats": "lrc",
-    "extra_args": []
+    "extra_args": [
+      "--enable_batching",
+      "--batch_size=32",
+      "--smart_split_with_vad=false"
+    ]
   },
   "app": {
     "lrc_max_lines_per_request": 100,
@@ -192,6 +202,7 @@
     "rj_lookup_depth": 4,
     "skip_hanhua_files": false,
     "srt_vtt_resync": true,
+    "nsfw_fallback_enabled": true,
     "delay_between_requests": 0.2,
     "work_dir": "",
     "input_path_file": "input_path.txt",
@@ -236,7 +247,8 @@
     "use_gpu": true
   },
   "prompts": {
-    "system_prompt_file": ""
+    "system_prompt_file": "",
+    "harmonize_system_prompt_file": ""
   },
   "network": {
     "clear_proxy_on_startup": false

@@ -622,6 +622,17 @@ class PipelineContext:
         self.skip_hanhua_files = bool(self.app_cfg.get('skip_hanhua_files', False))
         self.srt_vtt_resync = bool(self.app_cfg.get('srt_vtt_resync', True))
 
+        # ── NSFW 多级降级重试 ──
+        # 翻译因道德审查返回空白/拒绝时，逐级更换上下文重试：
+        #   第1级 完整上下文 → 第2级 和谐版世界观 → 第3级 仅和谐版角色表+术语 → 第4级 纯文本裸翻 → 跳过
+        # 关闭时保持旧行为：失败音轨进入轮级重试队列（translate_failed_max_retries）。
+        self.nsfw_fallback_enabled = bool(self.app_cfg.get('nsfw_fallback_enabled', True))
+        # 和谐化专用引擎缓存（api.harmonize 配置非空时独立于翻译引擎；懒加载）
+        self._harmonize_engine = None
+        # 按 RJ 组（wkey）的和谐版生成锁：防止同组多音轨并发重复生成
+        self._harmonize_locks: dict = {}
+        self._harmonize_locks_guard = threading.Lock()
+
         # RJ 号向上查找层数（进程级，供 find_rj_work_root 的默认值使用）
         from io_adapter.file_scanner import set_rj_lookup_depth
         set_rj_lookup_depth(self.app_cfg.get('rj_lookup_depth', 4))
@@ -2160,6 +2171,172 @@ def _enqueue_failed_track(ctx: PipelineContext, task: dict, reason: str) -> None
         ctx.retry_results[task['lrc_path'].name] = f'失败: {reason}'
 
 
+# ==================== NSFW 多级降级重试辅助 ====================
+
+def _get_harmonize_engine(ctx: PipelineContext):
+    """获取世界观和谐化专用引擎（懒加载，线程安全）。
+
+    config api.harmonize 的 key/base_url/model 全为空时直接复用翻译引擎；
+    任一非空时深拷贝配置、用非空字段覆盖 api 段对应键后创建独立引擎
+    （models 注册表、generation_params、超时等其余配置全部继承全局）。
+    """
+    with ctx.thread_lock:
+        if ctx._harmonize_engine is not None:
+            return ctx._harmonize_engine
+        h_cfg = (ctx.config.get('api', {}) or {}).get('harmonize') or {}
+        if not isinstance(h_cfg, dict):
+            h_cfg = {}
+        _has_override = any(str(h_cfg.get(k) or '').strip()
+                            for k in ('key', 'base_url', 'model'))
+        if not _has_override:
+            ctx._harmonize_engine = ctx.translate_engine
+            return ctx._harmonize_engine
+        import copy as _copy
+        merged = _copy.deepcopy(ctx.config)
+        api = merged.setdefault('api', {})
+        for _k in ('key', 'base_url', 'model', 'protocol'):
+            _v = str(h_cfg.get(_k) or '').strip()
+            if _v:
+                api[_k] = _v
+        from engines.translate_engine import create_translate_engine
+        ctx._harmonize_engine = create_translate_engine(
+            api,
+            verbose=ctx.pr.debug_enabled,
+            pricing=ctx.pricing,
+        )
+        _log(f"  [和谐] 使用独立和谐化 API: model={api.get('model')}")
+        return ctx._harmonize_engine
+
+
+def _load_harmonize_prompt(ctx: PipelineContext) -> str | None:
+    """读取用户自定义的和谐化前置 prompt（config prompts.harmonize_system_prompt_file）。
+
+    内容会拼接在内置 HARMONIZE_SYSTEM_PROMPT 之前，用于补充内置规则未覆盖的
+    高危类别（如血腥暴力）。文件不存在/读取失败时返回 None（回退纯内置规则），
+    与 prompts.system_prompt_file 的容错先例一致。
+    """
+    _p_file = (ctx.config.get('prompts', {}) or {}).get('harmonize_system_prompt_file', '')
+    if not _p_file:
+        return None
+    try:
+        _p_path = Path(_p_file)
+        if not _p_path.exists():
+            _log(f"  [和谐] 自定义前置 prompt 文件不存在，使用内置规则: {_p_file}")
+            return None
+        content = _p_path.read_text(encoding='utf-8')
+        if content.strip():
+            _log(f"  [和谐] 已加载自定义前置 prompt: {_p_file}（{len(content)} 字符）")
+            return content
+        _log(f"  [和谐] 自定义前置 prompt 文件为空，使用内置规则")
+        return None
+    except Exception as e:
+        _log(f"  [和谐] 自定义前置 prompt 读取失败（{e}），使用内置规则")
+        return None
+
+
+def _ensure_harmonized_worldview(ctx: PipelineContext, wkey: str, worldview: dict,
+                                 label: str = '') -> dict | None:
+    """获取（不存在则生成）当前作品组的和谐版世界观。
+
+    - 和谐版文件已存在（同组其他音轨生成过）→ 直接读取复用，不重新生成；
+    - 无原始世界观可和谐 → 返回 None（调用方直接跳过依赖和谐版的降级级别）；
+    - 生成走 LLM（api.harmonize 可配独立 API），per-wkey 锁 + 双重检查防止
+      同组多音轨并发翻译时重复生成。
+    失败（API 拒绝/解析失败）同样返回 None。
+    """
+    from engines.worldview_engine import (
+        get_harmonized_worldview_path, load_harmonized_worldview,
+        save_harmonized_worldview, harmonize_worldview_with_llm,
+    )
+    work_dir = Path(wkey)
+    hpath = get_harmonized_worldview_path(work_dir)
+
+    # 快路径：已有和谐版文件
+    if hpath.exists():
+        cached = load_harmonized_worldview(work_dir)
+        if cached:
+            _log(f"  [和谐] 复用已有和谐版世界观: {hpath.name}")
+            return cached
+
+    if not worldview:
+        return None
+
+    # 懒加载 per-wkey 锁，锁内双重检查
+    with ctx._harmonize_locks_guard:
+        _lock = ctx._harmonize_locks.get(wkey)
+        if _lock is None:
+            _lock = threading.Lock()
+            ctx._harmonize_locks[wkey] = _lock
+    with _lock:
+        if hpath.exists():
+            cached = load_harmonized_worldview(work_dir)
+            if cached:
+                return cached
+        _log(f"  [和谐] 首次生成和谐版世界观（{label or work_dir.name}）", console=True)
+        try:
+            engine = _get_harmonize_engine(ctx)
+            harmonized, h_token_stats = harmonize_worldview_with_llm(
+                engine, worldview, verbose=ctx.pr.debug_enabled,
+                extra_system_prompt=_load_harmonize_prompt(ctx))
+        except Exception as e:
+            _log(f"  [和谐] 世界观和谐化异常: {e}", console=True)
+            harmonized, h_token_stats = None, {}
+        # token 统计（无论成败都记，费用已实际发生）
+        if h_token_stats:
+            _h_cost = ctx.tracker.compute_cost(
+                h_token_stats.get('hit_tokens', 0),
+                h_token_stats.get('miss_tokens', 0),
+                h_token_stats.get('completion_tokens', 0),
+            )
+            with ctx.thread_lock:
+                ctx.tracker.record(TokenUsage(
+                    request_type='harmonize',
+                    label=f'{work_dir.name} 世界观',
+                    work_key=str(work_dir),
+                    prompt_tokens=h_token_stats.get('prompt_tokens', 0),
+                    hit_tokens=h_token_stats.get('hit_tokens', 0),
+                    miss_tokens=h_token_stats.get('miss_tokens', 0),
+                    completion_tokens=h_token_stats.get('completion_tokens', 0),
+                    reasoning_tokens=h_token_stats.get('reasoning_tokens', 0) or 0,
+                    cost=_h_cost,
+                    elapsed=0,
+                ))
+                ctx.pr.token_inline(ctx.tracker.records[-1])
+        if harmonized:
+            save_harmonized_worldview(work_dir, harmonized)
+            _chars = harmonized.get('characters', [])
+            _char_n = len(_chars) if isinstance(_chars, (list, dict)) else 0
+            _log(f"  [和谐] 和谐版世界观已保存: {hpath.name}（{_char_n} 个角色）")
+            return harmonized
+        _log(f"  [和谐] 世界观和谐化失败，跳过依赖和谐版的降级级别", console=True)
+        return None
+
+
+def _write_translate_failure_log(lrc_path: Path, ctx: PipelineContext,
+                                 attempt_desc: str, reason: str,
+                                 raw_excerpt: str = '') -> None:
+    """翻译（或和谐化）请求失败时，向音频所在目录 log/<音频同名>.log 追加一条记录。
+
+    同一音频多次失败记录在同一文件中，每条带时间戳与请求序号分隔。
+    日志写入失败只提示，不影响翻译主流程。
+    """
+    try:
+        log_dir = lrc_path.parent / 'log'
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{lrc_path.stem}.log"
+        _ts = time.strftime('%Y-%m-%d %H:%M:%S')
+        parts = [f"\n{'═' * 56}",
+                 f"[{_ts}] {attempt_desc}",
+                 f"失败原因: {reason}"]
+        if raw_excerpt:
+            parts.append(f"API 原始返回（截断 {min(len(raw_excerpt), 4000)} 字）:")
+            parts.append(raw_excerpt[:4000])
+        with open(log_file, 'a', encoding='utf-8') as f:
+            f.write('\n'.join(parts) + '\n')
+    except Exception as e:
+        _log(f"  [失败日志] 写入失败: {e}")
+
+
 # ==================== 单文件翻译 ====================
 
 def translate_one_lrc(
@@ -2285,6 +2462,13 @@ def translate_one_lrc(
             if _old_i in scriptbook_aligned
         }
 
+    # 滤空后无有效文本行（原文全是空行/纯空格）：无内容可翻，直接跳过
+    if not _texts_eff:
+        _log(f"  [跳过] 滤空后无有效文本行，跳过翻译")
+        with ctx.thread_lock:
+            ctx.stats["skipped"] += 1
+        return False
+
     # 编号（整文件一次性翻译，每行附 sb 作含义参考）
     numbered = [f"{i+1:04d}: {t}" for i, t in enumerate(_texts_eff)]
 
@@ -2300,13 +2484,6 @@ def translate_one_lrc(
         _log(f"\n[翻译] 整文件翻译: {len(_texts_eff)} 行(已滤空行), {sum(len(t) for t in _texts_eff)} 字符")
 
     translated_texts: list[str] = []
-    _chunk_start_t = time.time()
-    _total_hit = 0
-    _total_miss = 0
-    _total_prompt = 0
-    _total_comp = 0
-    _total_cost = 0.0
-    _total_reasoning = 0
 
     # 构造分块列表
     _chunks: list[list[int]] = []  # 每块 = 行索引列表
@@ -2316,118 +2493,214 @@ def translate_one_lrc(
     else:
         _chunks.append(list(range(len(_texts_eff))))
 
-    _all_ok = True
-    _fr_list: list = []  # 各块 finish_reason（诊断空内容失败用）
-    _last_reason_preview = ''  # 末块思维链预览（诊断用）
-    for _ci, _chunk_idx in enumerate(_chunks):
-        _chunk_numbered = [numbered[i] for i in _chunk_idx]
-        # 分块内 scriptbook_aligned：把原始行索引 i 映射为子块内索引 (i - 块起点)
-        _chunk_sb = None
-        if scriptbook_aligned:
-            _chunk_sb = {}
-            _base = _chunk_idx[0]
-            for _i in _chunk_idx:
-                if _i in scriptbook_aligned:
-                    _chunk_sb[_i - _base] = scriptbook_aligned[_i]
+    # ── 多级降级重试（NSFW 道德审查规避）────────────────────────────
+    # 单音轨内以整轨为单位逐级更换上下文重试，块级快速失败（任一整块解析失败
+    # 即终止本级，不浪费后续块请求）：
+    #   第1级 完整上下文（世界观+角色+术语，与旧行为一致）
+    #   第2级 和谐版世界观+角色表（LLM 改写高危设定；术语/alias 保留原版）
+    #   第3级 无世界观，仅和谐版角色表+术语
+    #   第4级 纯文本裸翻（不带任何术语/角色/世界观）
+    # 任一级成功即写文件；第4级仍失败则跳过该音轨（不再入轮级重试队列）。
+    # app.nsfw_fallback_enabled=false 时仅第1级，失败走旧逻辑进入轮级重试队列。
+    _fallback_on = bool(getattr(ctx, 'nsfw_fallback_enabled', False))
 
-        if _use_chunk:
-            _log(f"  [块 {_ci+1}/{len(_chunks)}] 行 {_chunk_idx[0]+1}-{_chunk_idx[-1]+1}，发送请求...")
+    def _run_pass(pass_terms, pass_alias, pass_worldview) -> dict:
+        """以指定上下文完整跑一遍分块翻译（供多级降级重试逐级调用）。
+
+        返回: {ok, reason, raw, translated, hit, miss, prompt, comp,
+               cost, reasoning, elapsed, fr_list, reason_preview}
+        - ok=False 时 reason 为失败原因、raw 为失败块的 API 原始返回（写失败日志用）
+        - 快速失败：API 异常或任一整块（≥5行）解析失败立即终止本级
+        - 翻译结果全空（模型被内容策略拦截的典型表现）同样判本级失败
+        """
+        _p_translated: list[str] = []
+        _p_hit = _p_miss = _p_prompt = _p_comp = _p_reasoning = 0
+        _p_cost = 0.0
+        _p_fr: list = []
+        _p_reason_preview = ''
+        _p_fail_reason = ''
+        _p_fail_raw = ''
+        _p_start = time.time()
+        for _ci, _chunk_idx in enumerate(_chunks):
+            _chunk_numbered = [numbered[i] for i in _chunk_idx]
+            # 分块内 scriptbook_aligned：把原始行索引 i 映射为子块内索引 (i - 块起点)
+            _chunk_sb = None
+            if scriptbook_aligned:
+                _chunk_sb = {}
+                _base = _chunk_idx[0]
+                for _i in _chunk_idx:
+                    if _i in scriptbook_aligned:
+                        _chunk_sb[_i - _base] = scriptbook_aligned[_i]
+
+            if _use_chunk:
+                _log(f"  [块 {_ci+1}/{len(_chunks)}] 行 {_chunk_idx[0]+1}-{_chunk_idx[-1]+1}，发送请求...")
+            else:
+                _log(f"  → 时间: {time.strftime('%H:%M:%S')}, 发送请求...")
+            _call_start = time.time()
+            try:
+                result = ctx.translate_engine.translate_batch(
+                    _chunk_numbered, terms=pass_terms,
+                    alias_list=pass_alias,
+                    worldview=pass_worldview,
+                    scriptbook_lines=scriptbook_lines,
+                    scriptbook_aligned=_chunk_sb,
+                    skip_hallucination_check=True,
+                )
+            except Exception as _tx_e:
+                # API 调用抛异常（网络/模型/超时/内容策略拒绝）：本级立即失败
+                _p_fail_reason = f"[翻译调用异常] {_tx_e}"
+                break
+            _call_elapsed = time.time() - _call_start
+            try:
+                _p_fr.append(result.get('finish_reason'))
+                _p_reason_preview = result.get('reasoning_preview', '') or ''
+            except Exception:
+                pass
+
+            translated_batch = result.get('translated_lines', [])
+            # 块级快速失败：整块解析失败（模型拒答/非 JSON 输出）→ 终止本级
+            _parsed_count_block = result.get('parsed_count', 0)
+            if _parsed_count_block == 0 and len(_chunk_idx) >= 5:
+                _p_fail_reason = (f"[分块翻译] 第 {_ci+1}/{len(_chunks)} 块解析失败"
+                                  f"（原文{len(_chunk_idx)}行全部留空）")
+                _p_fail_raw = result.get('raw_response', '') or ''
+                break
+            # 累加 token / 费用统计
+            _p_hit += result.get('hit_tokens', 0)
+            _p_miss += result.get('miss_tokens', 0)
+            _p_comp += result.get('completion_tokens', 0)
+            _p_cost += result.get('cost', 0.0)
+            _p_prompt += result.get('prompt_tokens', 0) or 0
+            _p_reasoning += result.get('reasoning_tokens', 0) or 0
+
+            # 块内解析出的行数可能少于块行数，补齐为空
+            while len(translated_batch) < len(_chunk_idx):
+                translated_batch.append('')
+            for t_line in translated_batch[:len(_chunk_idx)]:
+                if ': ' in t_line:
+                    t_line = t_line.split(': ', 1)[1]
+                if t_line == '[EMPTY_LINE]':
+                    t_line = ''
+                _p_translated.append(t_line)
+            if _use_chunk:
+                _n_empty = sum(1 for t in translated_batch[:len(_chunk_idx)] if not (t or '').strip())
+                _log(f"  [块 {_ci+1}/{len(_chunks)}] 完成: 解析 {len(translated_batch[:len(_chunk_idx)])} 行, "
+                     f"非空 {len(_chunk_idx)-_n_empty} 行, 耗时 {_call_elapsed:.1f}s")
+            elif not getattr(ctx, 'parallel_mode', False):
+                _log(f"  ← 响应: {len(translated_batch)} 行, 耗时 {_call_elapsed:.1f}s")
+
+        _p_elapsed = time.time() - _p_start
+        # 全空判定：解析有结果但全部为空串（模型被拦截的另一典型表现）→ 本级失败
+        if not _p_fail_reason:
+            if not any(t and t.strip() for t in _p_translated):
+                _p_fail_reason = (f"[翻译全空] {len(_p_translated)} 行译文均无有效内容"
+                                  f"（可能被内容策略拦截）")
+                _p_fail_raw = result.get('raw_response', '') or ''
+                _log(f"  WARN: 所有行为空！首3行原文: {[t[:40] for t in texts[:3]]}")
+
+        return {
+            'ok': not _p_fail_reason,
+            'reason': _p_fail_reason,
+            'raw': _p_fail_raw,
+            'translated': _p_translated,
+            'hit': _p_hit, 'miss': _p_miss, 'prompt': _p_prompt,
+            'comp': _p_comp, 'cost': _p_cost, 'reasoning': _p_reasoning,
+            'elapsed': _p_elapsed, 'fr_list': _p_fr, 'reason_preview': _p_reason_preview,
+        }
+
+    # RJ 作品根（token 统计与和谐版文件归属使用）
+    _rj_root, _ = find_rj_work_root(lrc_path)
+    _work_key = str(_rj_root) if _rj_root else str(lrc_path.parent)
+    _wkey_eff = wkey or _work_key
+
+    _harmonized = None        # 和谐版世界观（第1级失败后生成/读取）
+    _harmonized_tried = False
+    _max_levels = 4 if _fallback_on else 1
+    _pass_res = None
+    _eff_terms, _eff_alias, _eff_worldview = terms, alias_list, worldview
+
+    for _lv in range(1, _max_levels + 1):
+        # 组装本级上下文
+        if _lv == 1:
+            _lv_desc = '第1次请求(完整上下文: 世界观+角色+术语)'
+            _pt, _pa, _pw = terms, alias_list, worldview
+        elif _lv in (2, 3):
+            # 第2/3级依赖和谐版世界观；生成失败或无原始世界观时跳过
+            if _harmonized is None:
+                continue
+            if _lv == 2:
+                _lv_desc = '第2次请求(和谐版世界观+角色表, 术语保留)'
+                _pt, _pa, _pw = terms, alias_list, _harmonized
+            else:
+                _h_chars = _harmonized.get('characters') if isinstance(_harmonized, dict) else None
+                if not _h_chars:
+                    continue
+                _lv_desc = '第3次请求(无世界观, 和谐版角色表+术语)'
+                _pt, _pa, _pw = terms, alias_list, {'characters': _h_chars}
         else:
-            _log(f"  → 时间: {time.strftime('%H:%M:%S')}, 发送请求...")
-        call_start = time.time()
+            _lv_desc = '第4次请求(纯文本, 无任何附加上下文)'
+            _pt, _pa, _pw = None, None, None
+
+        if _lv > 1:
+            _log(f"\n[降级重试] {lrc_path.name}: {_lv_desc}", console=True)
+
+        _pass_res = _run_pass(_pt, _pa, _pw)
+
+        # token 统计：本级无论成败都记录（费用已实际发生）
+        usage = TokenUsage(
+            request_type='translate',
+            label=lrc_path.name,
+            work_key=_work_key,
+            prompt_tokens=_pass_res['prompt'],
+            hit_tokens=_pass_res['hit'],
+            miss_tokens=_pass_res['miss'],
+            completion_tokens=_pass_res['comp'],
+            reasoning_tokens=_pass_res['reasoning'],
+            cost=_pass_res['cost'],
+            elapsed=_pass_res['elapsed'],
+        )
+        with ctx.thread_lock:
+            ctx.tracker.record(usage)
+            ctx.pr.token_inline(usage)
+
+        if _pass_res['ok']:
+            translated_texts = _pass_res['translated']
+            _eff_terms, _eff_alias, _eff_worldview = _pt, _pa, _pw
+            break
+
+        # ── 本级失败：打印诊断 + 写音频同名失败日志（仅多级降级开启时），准备降级 ──
         try:
-            result = ctx.translate_engine.translate_batch(
-                _chunk_numbered, terms=terms,
-                alias_list=alias_list,
-                worldview=worldview,
-                scriptbook_lines=scriptbook_lines,
-                scriptbook_aligned=_chunk_sb,
-                skip_hallucination_check=True,
-            )
-        except Exception as _tx_e:
-            # API 调用抛异常（网络/模型/超时）：同样收集到重试队列，待其他音轨完成后重试
-            _tx_reason = f"[翻译调用异常] {_tx_e}"
-            _log(f"  [异常翻译] {lrc_path.name}: {_tx_reason}", console=True)
-            _max_r = getattr(ctx, 'max_failed_retries', 3)
-            _log(f"  [异常翻译] 标记为翻译失败，不写入文件，待其他音轨全部完成后重试"
-                 f"（已尝试 {attempts} 次，最多重试 {_max_r} 次）")
-            _enqueue_failed_track(ctx, {
-                'lrc_path': lrc_path,
-                'label': label,
-                'wkey': wkey,
-                'terms': terms,
-                'alias_list': alias_list,
-                'worldview': worldview,
-                'scriptbook_lines': scriptbook_lines,
-                'attempts': attempts,
-            }, _tx_reason)
-            return False
-        call_elapsed = time.time() - call_start
-        try:
-            _fr_list.append(result.get('finish_reason'))
-            _last_reason_preview = result.get('reasoning_preview', '') or ''
-        except Exception:
-            pass
-
-        translated_batch = result.get('translated_lines', [])
-        # 若分块翻译失败（全空/异常），记 _all_ok=False，仍继续后续块
-        _parsed_count_block = result.get('parsed_count', 0)
-        if _parsed_count_block == 0 and len(_chunk_idx) >= 5:
-            _all_ok = False
-        # 累加 token / 费用统计
-        _total_hit += result.get('hit_tokens', 0)
-        _total_miss += result.get('miss_tokens', 0)
-        _total_comp += result.get('completion_tokens', 0)
-        _total_cost += result.get('cost', 0.0)
-        _total_prompt += result.get('prompt_tokens', 0) or 0
-        _total_reasoning += result.get('reasoning_tokens', 0) or 0
-
-        # 块内解析出的行数可能少于块行数，补齐为空
-        while len(translated_batch) < len(_chunk_idx):
-            translated_batch.append('')
-        for t_line in translated_batch[:len(_chunk_idx)]:
-            if ': ' in t_line:
-                t_line = t_line.split(': ', 1)[1]
-            if t_line == '[EMPTY_LINE]':
-                t_line = ''
-            translated_texts.append(t_line)
-        if _use_chunk:
-            _n_empty = sum(1 for t in translated_batch[:len(_chunk_idx)] if not (t or '').strip())
-            _log(f"  [块 {_ci+1}/{len(_chunks)}] 完成: 解析 {len(translated_batch[:len(_chunk_idx)])} 行, "
-                 f"非空 {len(_chunk_idx)-_n_empty} 行, 耗时 {call_elapsed:.1f}s")
-
-    call_elapsed_total = time.time() - _chunk_start_t
-
-    # ═══════════════════════════════════════════════════════════
-    # 异常翻译判定：整文件翻译时仅当解析失败（parsed_count==0）判定失败；
-    # 分块翻译时，若有任一整块解析失败（全空）则判定失败。
-    # 判定为失败：不写文件、不入统计，加入重试队列，
-    # 待其他音轨全部完成后统一重试（最多 max_failed_retries 次）。
-    # 主线程只打印一行简洁失败提示（详细 JSON 诊断已在 worker 日志输出）。
-    # ═══════════════════════════════════════════════════════════
-    _n_input = len(_texts_eff)
-    _abnormal_reason = ''
-    if _use_chunk:
-        if not _all_ok:
-            _abnormal_reason = f"[分块翻译] 存在整块解析失败（原文{_n_input}行）"
-    elif _n_input >= 5:
-        # 整文件翻译：取最后一块的 parsed_count（无分块时即唯一块）
-        _parsed_count = result.get('parsed_count', 0)
-        if _parsed_count == 0:
-            _abnormal_reason = f"[JSON解析] 失败！原文{_n_input}行全部留空"
-    if _abnormal_reason:
-        _max_r = getattr(ctx, 'max_failed_retries', 3)
-        _log(f"  [异常翻译] {lrc_path.name}: {_abnormal_reason}", console=True)
-        try:
-            _fr_show = sorted({str(_f) for _f in _fr_list if _f})
+            _fr_show = sorted({str(_f) for _f in _pass_res.get('fr_list', []) if _f})
         except Exception:
             _fr_show = []
+        _log(f"  [异常翻译] {lrc_path.name}: {_pass_res['reason']}", console=True)
+        _log(f"  [异常翻译] 停因:{','.join(_fr_show) if _fr_show else '?'}"
+             f" 思考{_pass_res['reasoning']}tok/输出{_pass_res['comp']}tok")
+        if _pass_res.get('reason_preview'):
+            _log(f"  [异常翻译] 思维链预览: {_pass_res['reason_preview'][:500]}")
+        if _fallback_on:
+            _write_translate_failure_log(lrc_path, ctx, _lv_desc, _pass_res['reason'], _pass_res['raw'])
+
+        # 第1级失败后首次触发和谐版生成（同组其他音轨已生成时直接复用文件）
+        if _lv == 1 and _fallback_on and not _harmonized_tried:
+            _harmonized_tried = True
+            _harmonized = _ensure_harmonized_worldview(ctx, _wkey_eff, worldview, label)
+    else:
+        # ── 全部级别失败 ──
+        _final_reason = (_pass_res or {}).get('reason', '未知原因')
+        if _fallback_on:
+            # 多级降级耗尽 → 跳过该音轨（不再进入轮级重试队列）。
+            # 统计口径与"原文为空"等内部跳过分支一致；retry_results 不以"失败"
+            # 开头，避免批式/串行外层误判为"待重试"（实际已无重试）。
+            _log(f"  [异常翻译] {lrc_path.name}: 多级降级重试全部失败，跳过该音轨", console=True)
+            with ctx.thread_lock:
+                ctx.stats['skipped'] += 1
+            ctx.retry_results[lrc_path.name] = f'多级降级后跳过: {_final_reason}'
+            return False
+        # 开关关闭：维持旧行为，不写文件、进入轮级重试队列
+        _max_r = getattr(ctx, 'max_failed_retries', 3)
         _log(f"  [异常翻译] 标记为翻译失败，不写入文件，待其他音轨全部完成后重试"
-             f"（已尝试 {attempts} 次，最多重试 {_max_r} 次）"
-             f"（停因:{','.join(_fr_show) if _fr_show else '?'}"
-             f" 思考{_total_reasoning}tok/输出{_total_comp}tok）")
-        if _last_reason_preview:
-            _log(f"  [异常翻译] 思维链预览: {_last_reason_preview[:500]}")
+             f"（已尝试 {attempts} 次，最多重试 {_max_r} 次）")
         _enqueue_failed_track(ctx, {
             'lrc_path': lrc_path,
             'label': label,
@@ -2437,69 +2710,25 @@ def translate_one_lrc(
             'worldview': worldview,
             'scriptbook_lines': scriptbook_lines,
             'attempts': attempts,
-        }, _abnormal_reason)
+        }, _final_reason)
         return False
 
-    if getattr(ctx, 'parallel_mode', False):
-        # 并行模式下省略逐文件耗时统计，避免刷屏（由进度行汇总）
-        pass
-    else:
-        _log(f"  ← 响应: {len(translated_batch)} 行, 耗时 {call_elapsed:.1f}s")
     non_empty = [t for t in translated_texts if t and t.strip()]
     if not getattr(ctx, 'parallel_mode', False):
         _log(f"    有效行: {len(non_empty)}/{len(translated_texts)}")
-    if not non_empty:
-        _log(f"  WARN: 所有行为空！首3行原文: {[t[:40] for t in texts[:3]]}")
-    elif ctx.pr.debug_enabled:
+    if ctx.pr.debug_enabled:
         for i, t in enumerate(non_empty[:3]):
             _log(f"      [{i+1}] {t[:80]}")
-    # token 统计：分块时累加所有块的 token；整文件时用单块 result
-    if _use_chunk:
-        # 聚合循环中累加的 token
-        hit = _total_hit
-        miss = _total_miss
-        prompt = _total_prompt
-        comp = _total_comp
-        cost = _total_cost
-        elapsed = call_elapsed_total
-        reasoning = _total_reasoning
-    else:
-        hit = result.get('hit_tokens', 0)
-        miss = result.get('miss_tokens', 0)
-        prompt = result.get('prompt_tokens', hit + miss)
-        comp = result.get('completion_tokens', 0)
-        elapsed = result.get('elapsed', call_elapsed)
-        cost = result.get('cost', 0)
-        reasoning = result.get('reasoning_tokens', 0) or 0
 
-    # 统一 token 追踪：记录 + 打印
-    # work_key 使用 RJ 作品根目录，确保同一作品的翻译/台本/世界观合并统计
-    _rj_root, _ = find_rj_work_root(lrc_path)
-    _work_key = str(_rj_root) if _rj_root else str(lrc_path.parent)
-
-    usage = TokenUsage(
-        request_type='translate',
-        label=lrc_path.name,
-        work_key=_work_key,
-        prompt_tokens=prompt,
-        hit_tokens=hit,
-        miss_tokens=miss,
-        completion_tokens=comp,
-        reasoning_tokens=reasoning,
-        cost=cost,
-        elapsed=elapsed,
-    )
+    # 成功音轨统计（token 用量已在各级 pass 中逐级记录，含失败的降级尝试）
     with ctx.thread_lock:
-        ctx.tracker.record(usage)
-        ctx.pr.token_inline(usage)
-
-        ctx.stats['success_lines'] += len(translated_batch)
-        ctx.stats['total_lines'] += len(translated_batch)
+        ctx.stats['success_lines'] += len(translated_texts)
+        ctx.stats['total_lines'] += len(translated_texts)
         ctx.stats['api_calls'] += 1
-        ctx.stats['total_cost'] += cost
-        ctx.stats['total_hit_tokens'] += hit
-        ctx.stats['total_miss_tokens'] += miss
-        ctx.stats['total_completion_tokens'] += comp
+        ctx.stats['total_cost'] += _pass_res['cost']
+        ctx.stats['total_hit_tokens'] += _pass_res['hit']
+        ctx.stats['total_miss_tokens'] += _pass_res['miss']
+        ctx.stats['total_completion_tokens'] += _pass_res['comp']
 
     # 补齐不足的行（翻译失败的回退）
     shortage = 0
@@ -2512,10 +2741,11 @@ def translate_one_lrc(
 
     # 润色（Post-editing）：config app.polish_after_translate=true 时启用。
     # 只返回需要润色的行并写回，术语表/世界观一并发送以保护既定译名。
+    # 使用成功那一级降级的上下文（可能是和谐版/裸翻级）。
     if ctx.config.get('app', {}).get('polish_after_translate', False):
         try:
             _polish_map = ctx.translate_engine.polish_batch(
-                translated_texts, terms=terms, worldview=worldview, alias_list=alias_list)
+                translated_texts, terms=_eff_terms, worldview=_eff_worldview, alias_list=_eff_alias)
             if _polish_map:
                 _changed = 0
                 for _idx, _new_txt in _polish_map.items():
@@ -2542,14 +2772,6 @@ def translate_one_lrc(
                     ctx.stats['archived'] = ctx.stats.get('archived', 0) + 1
             except Exception as e:
                 _log(f"  [留档失败] {target_path.name}: {e}")
-
-    # 翻译全空但原文非空 → 不覆盖，保留原文件
-    trans_chars = sum(len(t) for t in translated_texts if t)
-    if trans_chars == 0 and total_chars > 0:
-        _log(f"  [跳过写入] 翻译结果全空，保留原文件不覆盖")
-        with ctx.thread_lock:
-            ctx.stats["skipped"] += 1
-        return False
 
     # 写回翻译结果（通用字幕格式；过滤空行，只保留非空歌词行）
     # 原子写：进程中途被杀只会留下完整旧文件或完整新文件，不会产生半截字幕

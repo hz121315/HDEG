@@ -145,7 +145,7 @@ HDEG 不绑定单一厂商。模型行为由 `config.json → api.models` 注册
 
 - 五个 `Hde鸡-翻译*.bat` 行为完全一致：把拖入的目录写进 `input_path.txt`（支持多行 = 多目录，转录依次进行、翻译并行推进），然后启动 `main.exe`。**bat 不再自行调用 infer.exe 转录**，任选一个使用即可。
 - 转录参数统一在 `config.json → transcription`：`infer_exe`、`model_dir`、`device`、`compute_type`、`audio_suffixes`、`sub_formats`、`extra_args`。
-- `transcription.extra_args` 可透传任意 infer 参数，显存 8G 以上推荐：
+- **发布件与模板已默认高性能转录参数**（按 9700X + 32G + 5070 Ti 配置，无需手动改）：
 
   ```json
   "transcription": {
@@ -154,7 +154,7 @@ HDEG 不绑定单一厂商。模型行为由 `config.json → api.models` 注册
   }
   ```
 
-  `--smart_split_with_vad=false` 解决"一句一句转录"（关掉按 VAD 逐块切分）；`--enable_batching --batch_size=N` 提升吞吐与显存利用率；`int8_float16` 只省显存、反而更慢且精度略低。
+  `--smart_split_with_vad=false` 解决"一句一句转录"（关掉按 VAD 逐块切分）；`--enable_batching --batch_size=N` 提升吞吐与显存利用率；`int8_float16` 只省显存、反而更慢且精度略低。低显存机器改回方式见《使用说明.md》。`extra_args` 非空时即为最终生效值，运行时按显存自动调参让位；打包脚本会强制写入这组默认值。
 
 更多参数说明见《使用说明.md》。
 

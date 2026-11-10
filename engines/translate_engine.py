@@ -82,6 +82,7 @@ class TranslationResult(TypedDict, total=False):
     finish_reason: str | None    # 模型停止原因（stop/length/…，诊断空内容失败用）
     reasoning_chars: int         # 思维链字符数（诊断用）
     reasoning_preview: str       # 思维链前600字单行预览（诊断用）
+    raw_response: str            # 模型原始返回文本（随结果走，供失败日志记录，避免共享引擎实例字段的并发竞态）
     cost: float                  # 费用
     elapsed: float               # 本次调用耗时（秒）
 
@@ -1150,6 +1151,7 @@ class OpenAICompatEngine:
             finish_reason=token_stats.get('finish_reason'),
             reasoning_chars=token_stats.get('reasoning_chars', 0) or 0,
             reasoning_preview=token_stats.get('reasoning_preview', '') or '',
+            raw_response=translated_text,
             cost=cost,
             elapsed=call_elapsed,
         )

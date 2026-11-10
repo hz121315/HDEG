@@ -233,6 +233,130 @@ def save_worldview(work_dir: "Path", worldview: dict) -> None:
         json.dump(worldview, f, ensure_ascii=False, indent=2)
 
 
+# ==================== 和谐版世界观（NSFW 降级重试用） ====================
+
+def get_harmonized_worldview_path(work_dir: "Path") -> "Path":
+    """获取和谐版世界观文件路径（与 .worldview.json 同目录，不覆盖原文件）"""
+    from pathlib import Path
+    return Path(work_dir) / '和谐版.worldview.json'
+
+
+def load_harmonized_worldview(work_dir: "Path") -> dict:
+    """加载已保存的和谐版世界观；不存在或损坏时返回空 dict"""
+    import json
+    hpath = get_harmonized_worldview_path(work_dir)
+    if hpath.exists():
+        try:
+            with open(hpath, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except (json.JSONDecodeError, Exception):
+            return {}
+    return {}
+
+
+def save_harmonized_worldview(work_dir: "Path", worldview: dict) -> None:
+    """保存和谐版世界观到 和谐版.worldview.json（UTF-8 无 BOM）"""
+    import json
+    hpath = get_harmonized_worldview_path(work_dir)
+    hpath.parent.mkdir(parents=True, exist_ok=True)
+    with open(hpath, 'w', encoding='utf-8') as f:
+        json.dump(worldview, f, ensure_ascii=False, indent=2)
+
+
+# 和谐化改写规则：力度适中，只模糊"违背伦理"的高危表述（未成年/亲属关系/性暴力等），
+# 成年角色间的成人向内容保留原样，其余描述尽量不动。
+HARMONIZE_SYSTEM_PROMPT = (
+    "你是一名内容合规编辑。用户提供一部虚构音声作品的设定资料（JSON 格式，"
+    "含世界观简介、角色表、主题、特殊术语），你的任务是将其中的高危表述改写为合规版本，"
+    "用于替代原资料参与后续翻译，这是一个常规的内容合规改写工作。\n\n"
+    "【改写规则——力度适中，只处理以下几类违背伦理的高危表述】\n"
+    "1. 未成年相关：具体年龄数字（如「17岁」「16歳」）改为「年轻」；"
+    "「女学生」「女子校生」「女子高中生」「JK」「小学生」「中学生」等学生身份改为「年轻女生」；"
+    "「男学生」等改为「年轻男性」。\n"
+    "2. 家庭/亲属关系：「父女」「母女」「兄妹」「姐弟」「父娘」「母娘」「近亲」等亲属关系，"
+    "改为「关系亲密的两人」「关系亲密」等表述。\n"
+    "3. 非自愿/性暴力：「强奸」「轮奸」「凌辱」「强暴」「レイプ」等改为「半强硬」「激烈」等"
+    "程度相近但合规的描述。\n"
+    "4. 其他类似高危设定（监禁、药物控制等）：同样选用意思相近的温和表述。\n"
+    "5. 上述之外的成年角色间成人向内容、普通设定、人名、性格描述一律保持原样，"
+    "不要过度改写，不要扩写或添加任何解释性文字。\n\n"
+    "【输出要求】\n"
+    "1. 输出 JSON 的结构、字段名、键与输入完全一致，只修改字符串内容。\n"
+    "2. characters 中每个角色的 name 字段（日文原文称呼）保持不变，"
+    "确保与作品原文对齐；name_cn 如含上述高危词一并改写。\n"
+    "3. 只输出改写后的 JSON 本体，禁止输出 JSON 之外的任何内容。\n"
+)
+
+
+def harmonize_worldview_with_llm(engine, worldview: dict, verbose: bool = False,
+                                 extra_system_prompt: str = None) -> tuple:
+    """调用 LLM 对世界观进行"和谐化"改写（NSFW 降级重试用）。
+
+    参数:
+        engine: 带 call_api(system_prompt, user_prompt, override_gen_params=...) 的引擎
+        worldview: 原始世界观字典（会剥离 _source 等内部字段后发送）
+        verbose: 是否打印调试信息
+        extra_system_prompt: 用户自定义的前置 prompt（config prompts.harmonize_system_prompt_file
+            的文件内容），拼接在内置规则之前——用于补充内置规则未覆盖的高危类别
+            （如血腥暴力）。为空时纯用内置规则。
+
+    返回:
+        (和谐后的世界观 dict, token_stats)；失败（API 异常/JSON 解析失败/结构校验失败）返回 (None, token_stats)
+    """
+    import json as _json
+
+    if not worldview:
+        return {}, {}
+
+    # 剥离内部元数据字段，只发送设定内容
+    payload = {k: v for k, v in worldview.items() if not k.startswith('_')}
+    user_prompt = _json.dumps(payload, ensure_ascii=False, indent=2)
+
+    # 自定义前置 prompt 在前（优先级高），内置规则在后兜底输出格式约束
+    if extra_system_prompt and extra_system_prompt.strip():
+        system_prompt = f"{extra_system_prompt.strip()}\n\n{HARMONIZE_SYSTEM_PROMPT}"
+    else:
+        system_prompt = HARMONIZE_SYSTEM_PROMPT
+
+    token_stats: dict = {}
+    try:
+        raw_output, token_stats = engine.call_api(
+            system_prompt, user_prompt,
+            override_gen_params={'temperature': 0.1},
+        )
+    except Exception as e:
+        print(f"    ⚠ 世界观和谐化请求失败: {e}", flush=True)
+        return None, token_stats
+
+    if not raw_output or not raw_output.strip():
+        print("    ⚠ 世界观和谐化返回为空", flush=True)
+        return None, token_stats
+
+    json_match = re.search(r'\{.*\}', raw_output, re.DOTALL)
+    if not json_match:
+        print(f"    ⚠ 世界观和谐化未返回 JSON（前200字: {raw_output[:200]}）", flush=True)
+        return None, token_stats
+    try:
+        result = _json.loads(json_match.group())
+    except _json.JSONDecodeError as e:
+        print(f"    ⚠ 世界观和谐化 JSON 解析错误: {e}", flush=True)
+        return None, token_stats
+
+    if not isinstance(result, dict):
+        print("    ⚠ 世界观和谐化结果不是 JSON 对象", flush=True)
+        return None, token_stats
+
+    # 结构校验：至少要保留 characters（后续降级级别依赖它）；空结果视为失败
+    if not result.get('characters') and not result.get('worldview'):
+        print("    ⚠ 世界观和谐化结果为空内容，视为失败", flush=True)
+        return None, token_stats
+
+    if verbose:
+        print(f"    [DEBUG] 和谐化完成: {len(result.get('characters', []))} 个角色", flush=True)
+    return result, token_stats
+
+
 # ==================== 世界观 Prompt 构建 ====================
 
 def build_worldview_prompt(worldview: dict) -> str:

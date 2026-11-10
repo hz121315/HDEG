@@ -1,0 +1,32 @@
+{
+  "id": "001",
+  "name": "001",
+  "title": "HDEG 单进程转录翻译流水线改造",
+  "status": "review",
+  "priority": "P1",
+  "branch": "main",
+  "base_branch": "main",
+  "parent": null,
+  "children": [],
+  "commit": "cacf5e7c",
+  "pr_url": null,
+  "meta": {
+    "record_type": "retrospective",
+    "recorded_on": "2026-11-10",
+    "implementation_period": "2026-10-30 至 2026-11-10（依据会话与提交记录）",
+    "repository": "https://github.com/hz121315/HDEG",
+    "trellis_initialized": false,
+    "status_reason": "实现及发布已有提交，但静态核查发现流式进度、日志、重试与归档边界缺口，未做完整端到端验收，不能标为 completed。",
+    "latest_verified_baseline": "cacf5e7c",
+    "verification": "本轮只读核实源码及 Git 记录，未重新运行测试、构建、真实 GPU 转录或远程 API 请求。",
+    "artifacts": [
+      "README.md",
+      "prd.md",
+      "design.md",
+      "implement.md",
+      "changes.md",
+      "parameters.md",
+      "verification.md"
+    ]
+  }
+}
