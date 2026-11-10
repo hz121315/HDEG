@@ -20,7 +20,8 @@ from pathlib import Path
 
 # 获取脚本所在目录
 SCRIPT_DIR = Path(__file__).parent.resolve()
-RELEASE_DIR = SCRIPT_DIR / "Hde_G_release"
+# 发布产物输出到项目根 temp/（.gitignore 已排除；旧位置 Hde_G_release 仅作历史遗留）
+RELEASE_DIR = SCRIPT_DIR / "temp"
 
 
 def get_package_path(package_name):
