@@ -188,3 +188,13 @@ __pycache__/
 
 # 打包产物
 temp/
+
+# 用户指定的公开发布目录（main.exe 走 GitHub Release，不入 Git 历史）
+release/main.exe
+!/release/
+!/release/*.bat
+!/release/config.json
+!/release/*.md
+!/release/*.txt
+!/release/prompts/
+!/release/prompts/*.txt

@@ -105,6 +105,47 @@
 - 文档：`使用说明.md` api 段新增独立参数示例与语义。
 - 测试：新增 3 项（子段合并/独立引擎、harmonize temperature 尊重配置、worldview 同上），全量 81 passed。
 
+## 共享翻译引擎 parsed_count 并发误判修复
+
+- 仅修复本次用户指定的解析计数跨音轨污染，不改上下文、四级重试、模型配置或并发上限。
+- `translate_engine.py` 删除 `_last_parsed_count` 实例字段；新增三元组内部解析入口
+  `_parse_json_translation_with_count`，正常解析/打捞/失败分支均返回当前响应的计数。
+  原 `parse_json_translation` 仍保持双返回值接口兼容；`translate_batch` 通过局部变量传递计数，
+  内部空结果重试仅在采用重试响应时同步替换计数，保证计数与实际返回译文一致。
+- 新增 `tests/test_translation_count_isolation.py` 7 项：以 Event 控制成功/失败/不同数量请求
+  的线程交错，验证彼此不覆盖，并覆盖双返回值兼容、打捞计数及内部重试的响应选择。
+- 离线验证：定向解析测试 32 项通过；全量 88 passed、1 deselected、1 条已有 pkg_resources 弃用警告。
+  未调用真实 API、未打包、未提交或推送。
+
+## 失败日志请求时间、模型与生效设置
+
+- `api_client.py`：三种协议在实际发送前按白名单采集最终设置；单次 chat 本地列表保留所有
+  尝试的起止时间（带时区）、耗时、请求模型、响应模型、协议及序号，随响应/异常传递；
+  不保存到共享实例字段，不记录凭证、headers、messages、URL 或任意扩展配置。
+- `translate_engine.py`：诊断随 token_stats/TranslationResult 传递，内部空结果重试不丢历史记录。
+- `worldview_engine.py`：原版分析失败信息带诊断；和谐化保持双返回值，在 token_stats.failure_info
+  提供原因、原始返回、诊断。不改变提示词、生成参数和重试策略。
+- `orchestrator.py`：翻译日志记录级别/分块；worldview.log 和新增 harmonize.log 记录同一套诊断。
+  无实际发送记录时明确不可用；保留既有开关与追加语义。移除世界观失败日志中未实现的
+  “将从 ASR 直接生成和谐版”提示，避免误导。
+- 新增 API 诊断 mock 测试 25 项、失败日志链路测试 11 项，覆盖三协议、异常、参数剔除、
+  内部重试、并发隔离及白名单防泄露。含上一轮解析计数修复，离线全量 124 passed、1 deselected，
+  一条既有 pkg_resources 弃用警告；未真实调用 API、未打包、未提交推送。
+
+## 根目录 release 发布交付
+
+- 按用户要求将最新构建复制至根目录 `release/`（本地构建输出仍为 `temp/`），包含
+  脱敏 config、5 个 BAT、3 份 prompts、提示词与使用说明。
+- main.exe（约 117 MB）**未入库**：超过 GitHub 普通 Git 的 100 MiB 单文件上限；
+  改用 Git LFS 后被 GitHub 拒绝（公开 fork 不允许上传新 LFS 对象，
+  `can not upload new objects to public fork`）。exe 保留在本地 `release/`，
+  由用户通过 GitHub Release 附件或本地打包分发；`.gitignore` 已排除 `release/main.exe`。
+- 发布配置清理补齐独立 worldview/harmonize 及其他 API 层级的凭证，不再输出 key 前缀。
+- 日志边界修正：OpenAI 按 SDK 调用记录（可能包含 SDK 内部重试），其他两协议按 HTTP 请求记录；
+  新增 scope 字段与真实 SDK 的 MockTransport 回归，不改变重试策略。
+- 完整 exe 离线冒烟通过：parsed_count 独立返回、请求诊断、内嵌 translation.txt、pyopenjtalk.g2p。
+  最终全量 125 passed、1 deselected、1 条既有弃用警告；未调用真实翻译 API。
+
 ## 环境与打包经历（非业务代码变更）
 
 - 最初 GitHub 直连失败，先下载快照，后重试取得 Git 仓库；后续 origin 指向用户仓库 hz121315/HDEG。

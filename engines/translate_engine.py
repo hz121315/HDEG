@@ -82,6 +82,7 @@ class TranslationResult(TypedDict, total=False):
     finish_reason: str | None    # 模型停止原因（stop/length/…，诊断空内容失败用）
     reasoning_chars: int         # 思维链字符数（诊断用）
     reasoning_preview: str       # 思维链前600字单行预览（诊断用）
+    request_diagnostics: list[dict]  # 本次调用的实际请求时间、模型及发送参数（含内部重试）
     raw_response: str            # 模型原始返回文本（随结果走，供失败日志记录，避免共享引擎实例字段的并发竞态）
     cost: float                  # 费用
     elapsed: float               # 本次调用耗时（秒）
@@ -253,8 +254,6 @@ class OpenAICompatEngine:
         self.verbose = verbose
         self._system_prompt_file = system_prompt_file
         self._last_raw_response = ''
-        # 最近一次 JSON 解析实际提取的条目数（供 orchestrator 判定"翻译失败/异常截断"）
-        self._last_parsed_count = 0
         # 统一 API 调用层：模型轮换 / 参数剔除 / 重试逻辑全部内聚在 APIClient
         from engines.api_client import APIClient
         self._api = APIClient(config, verbose=verbose)
@@ -536,6 +535,7 @@ class OpenAICompatEngine:
                 _p(f"  [DEBUG] 返回内容(前5行):\n{resp_preview}", flush=True)
 
         token_stats = APIClient.extract_token_stats(response.usage)
+        token_stats['request_diagnostics'] = getattr(response, 'request_diagnostics', [])
         try:
             token_stats['finish_reason'] = (
                 getattr(msg, 'finish_reason', None) or response.choices[0].finish_reason
@@ -950,6 +950,20 @@ class OpenAICompatEngine:
         返回:
             (original_lines, translated_lines) —— 长度始终一致
         """
+        original, translated, _ = self._parse_json_translation_with_count(
+            original_lines, translated_text)
+        return original, translated
+
+    def _parse_json_translation_with_count(
+        self,
+        original_lines: list[str],
+        translated_text: str,
+    ) -> tuple[list[str], list[str], int]:
+        """解析译文并返回本次实际解析条数，避免共享引擎跨音轨污染计数。
+
+        对外的 parse_json_translation 仍返回两项；批量翻译直接使用三项结果，
+        计数与译文一起在当前调用栈中传递，不保存到引擎实例字段。
+        """
         import json as _json
 
         n_input = len(original_lines)
@@ -958,7 +972,6 @@ class OpenAICompatEngine:
         json_result = self._extract_json_array(translated_text)
         if json_result is not None:
             parsed_count = len(json_result)
-            self._last_parsed_count = parsed_count
             non_empty = sum(1 for x in json_result if x and x.strip())
             if self.verbose:
                 _p(f"  [JSON解析] 成功: {parsed_count}条, 非空{non_empty}条 (输入{n_input}行)")
@@ -979,25 +992,23 @@ class OpenAICompatEngine:
             if parsed_count > n_input and self.verbose:
                 _p(f"  [JSON解析] 翻译行数超出 ({parsed_count} > {n_input}), 尾部 {parsed_count - n_input} 行被丢弃")
 
-            return original_lines, translated
+            return original_lines, translated, parsed_count
 
         # 最终打捞：常规策略全灭时，按条扫描合法 {index, text}（容忍杂散文本/
         # 多余括号/前后废话），回声剔除防复读输入。覆盖率 ≥50% 才接受写文件，
         # 否则仍判失败走重试队列（重试可能拿满）。
         salvaged = OpenAICompatEngine._salvage_indexed_items(translated_text, original_lines)
         if salvaged and len(salvaged) * 2 >= n_input:
-            self._last_parsed_count = len(salvaged)
             _p(f"  [JSON解析] 打捞成功: {len(salvaged)}/{n_input} 条有效"
                f"（缺 {n_input - len(salvaged)} 行留空）")
             return original_lines, [
                 salvaged.get(i + 1, '') for i in range(n_input)
-            ]
+            ], len(salvaged)
         if salvaged:
             _p(f"  [JSON解析] 打捞不足: {len(salvaged)}/{n_input} 条，仍判失败走重试")
 
         # JSON 解析失败 —— 不启用逐行回退，记录错误并返回空。
         # 失败时打印原始返回全文（上限 30000 字，超出截断并注明），不再只看前后 100 字。
-        self._last_parsed_count = 0
         _p(f"  [JSON解析] 失败！原文{n_input}行全部留空")
         _p(f"  [JSON解析] 响应类型: {type(translated_text).__name__}, 长度: {len(translated_text)}")
         _RAW_CAP = 30000
@@ -1011,7 +1022,7 @@ class OpenAICompatEngine:
             _json_debug.loads(translated_text)
         except Exception as _e:
             _p(f"  [JSON解析] json.loads 报错: {_e}")
-        return original_lines, [''] * n_input
+        return original_lines, [''] * n_input, 0
 
     # ---------- 批量翻译 ----------
 
@@ -1091,8 +1102,11 @@ class OpenAICompatEngine:
         call_start = _time_mod.time()
         translated_text, token_stats = self.call_api(system_prompt, user_prompt)
         call_elapsed = _time_mod.time() - call_start
+        # 请求诊断独立于最终采用的译文，保留内部重试的每次实际发送记录。
+        request_diagnostics = list(token_stats.get('request_diagnostics') or [])
 
-        original_lines, translated_lines = self.parse_json_translation(lines, translated_text)
+        original_lines, translated_lines, parsed_count = self._parse_json_translation_with_count(
+            lines, translated_text)
 
         # 修复：模型偶尔跑偏输出非 JSON（英文注释/逐行说明），导致解析全空。
         # 默认关闭内部自动重试（一次失败直接判失败，由 orchestrator 重试队列处理）；
@@ -1108,11 +1122,14 @@ class OpenAICompatEngine:
                     system_prompt, user_prompt,
                     override_gen_params={'reasoning_effort': None},
                 )
+                request_diagnostics.extend(token_stats2.get('request_diagnostics') or [])
                 _call_elapsed2 = _time_mod.time() - _retry_start
-                original_lines2, translated_lines2 = self.parse_json_translation(lines, translated_text2)
+                original_lines2, translated_lines2, parsed_count2 = self._parse_json_translation_with_count(
+                    lines, translated_text2)
                 _retry_nonempty = len(translated_lines2) > 0 and any((t or '').strip() for t in translated_lines2)
                 if _retry_nonempty:
                     original_lines, translated_lines = original_lines2, translated_lines2
+                    parsed_count = parsed_count2
                     translated_text = translated_text2
                     token_stats = token_stats2
                     call_elapsed = call_elapsed2
@@ -1122,6 +1139,7 @@ class OpenAICompatEngine:
                     if self.verbose:
                         _p("  [翻译] 重试仍全空，放弃", flush=True)
             except Exception as _re:
+                request_diagnostics.extend(getattr(_re, 'request_diagnostics', []) or [])
                 if self.verbose:
                     _p(f"  [翻译] 重试失败: {_re}", flush=True)
 
@@ -1137,7 +1155,7 @@ class OpenAICompatEngine:
         return TranslationResult(
             original_lines=original_lines,
             translated_lines=translated_lines,
-            parsed_count=self._last_parsed_count,
+            parsed_count=parsed_count,
             hit_tokens=hit,
             miss_tokens=miss,
             prompt_tokens=prompt,
@@ -1147,6 +1165,7 @@ class OpenAICompatEngine:
             reasoning_chars=token_stats.get('reasoning_chars', 0) or 0,
             reasoning_preview=token_stats.get('reasoning_preview', '') or '',
             raw_response=translated_text,
+            request_diagnostics=request_diagnostics,
             cost=cost,
             elapsed=call_elapsed,
         )

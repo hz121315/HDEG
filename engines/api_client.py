@@ -14,6 +14,8 @@
 from __future__ import annotations
 import time as _time_mod
 import threading as _threading_mod
+from contextlib import contextmanager
+from datetime import datetime
 
 
 # 并行 worker 线程局部变量：worker 线程设置 _worker_id（如 0,1,2...），
@@ -175,6 +177,85 @@ def _set_dotted(target: dict, path: str, value) -> None:
     cur[parts[-1]] = value
 
 
+# 诊断专用白名单独立于可发送参数：注册表可注入任意 extra_body，
+# 但这里只保留已知生成字段及安全类型/枚举，不收录 user、stop 文本、JSON schema 等内容。
+_DIAGNOSTIC_SETTING_RULES = {
+    name: (int, float) for name in (
+        'max_tokens', 'max_completion_tokens', 'max_output_tokens',
+        'temperature', 'top_p', 'top_k', 'presence_penalty', 'frequency_penalty',
+        'seed', 'n', 'top_logprobs', 'thinking_budget',
+    )
+}
+_DIAGNOSTIC_EFFORTS = frozenset((
+    'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max',
+    'off', 'false', '0', 'disabled',
+))
+_DIAGNOSTIC_SETTING_RULES.update({
+    'reasoning_effort': _DIAGNOSTIC_EFFORTS,
+    'enable_thinking': (bool,),
+    'logprobs': (bool,),
+    'thinking': {
+        'type': frozenset(('enabled', 'disabled', 'adaptive')),
+        'budget_tokens': (int,),
+    },
+    'reasoning': {
+        'effort': _DIAGNOSTIC_EFFORTS,
+        'enabled': (bool,),
+        'exclude': (bool,),
+        'max_tokens': (int,),
+    },
+    'output_config': {'effort': _DIAGNOSTIC_EFFORTS},
+    'response_format': {'type': frozenset(('text', 'json_object', 'json_schema'))},
+})
+
+
+def _diagnostic_settings(params: dict, rules: dict = _DIAGNOSTIC_SETTING_RULES) -> dict:
+    """按固定字段、类型和枚举取独立快照，禁止动态 reasoning 路径泄露任意内容。"""
+    settings = {}
+    for name, rule in rules.items():
+        if name not in params:
+            continue
+        value = params[name]
+        if isinstance(rule, dict):
+            if isinstance(value, dict):
+                nested = _diagnostic_settings(value, rule)
+                if nested:
+                    settings[name] = nested
+        elif isinstance(rule, frozenset):
+            if isinstance(value, str) and value in rule:
+                settings[name] = value
+        elif type(value) in rule:
+            settings[name] = value
+    return settings
+
+
+@contextmanager
+def _request_diagnostic(diagnostics: list | None, *, model: str,
+                        protocol: str, params: dict):
+    """发送前追加记录，finally 覆盖请求/解析异常；列表仅属于当前 chat。"""
+    if diagnostics is None:
+        diagnostics = []
+    record = {
+        'started_at': datetime.now().astimezone().isoformat(),
+        'ended_at': None,
+        'elapsed': None,
+        'requested_model': model,
+        'response_model': None,
+        'protocol': protocol,
+        # OpenAI SDK 会在一次 create 调用内自行重试；不把 SDK 调用伪称为单次 HTTP。
+        'scope': 'sdk_call' if protocol == 'openai' else 'http_request',
+        'attempt': len(diagnostics) + 1,
+        'settings': _diagnostic_settings(params),
+    }
+    started = _time_mod.monotonic()
+    diagnostics.append(record)
+    try:
+        yield record
+    finally:
+        record['ended_at'] = datetime.now().astimezone().isoformat()
+        record['elapsed'] = _time_mod.monotonic() - started
+
+
 class _AnthropicAPIError(Exception):
     """Anthropic messages API 调用错误（携带 HTTP 状态码，供配额/参数识别复用）"""
 
@@ -194,7 +275,8 @@ class _CompatResponse:
 
     def __init__(self, text: str, prompt_tokens: int, hit_tokens: int, miss_tokens: int,
                  completion_tokens: int, finish_reason: str = 'stop',
-                 reasoning_tokens: int = 0):
+                 reasoning_tokens: int = 0, model: str | None = None):
+        self.model = model
         self.choices = [_CompatChoice(text, finish_reason)]
         self.usage = _CompatUsage(prompt_tokens, hit_tokens, miss_tokens,
                                   completion_tokens, reasoning_tokens)
@@ -810,11 +892,21 @@ class APIClient:
         返回:
             OpenAI ChatCompletion 对象（含 choices / usage）。
             调用方自行提取 response.choices[0].message.content 和 response.usage。
+            response.request_diagnostics 为本次 chat 的各次应用层发送调用记录（含失败重试），
+            OpenAI 的 SDK 调用可能包含内部 HTTP 重试，scope 字段明确记录粒度。
+            started_at/ended_at 为本地带时区 ISO 时间，elapsed 单位为秒。
 
         异常:
-            所有模型都配额耗尽或重试耗尽时，抛 RuntimeError。
+            所有模型都配额耗尽或重试耗尽时，抛 RuntimeError，
+            其 request_diagnostics 属性携带相同记录；初始化失败则为空列表。
         """
-        self._ensure_client()
+        request_diagnostics = []
+        try:
+            self._ensure_client()
+        except Exception as e:
+            # 初始化尚未发送请求，保留原异常类型和传播方式，空列表表示诊断不可用。
+            e.request_diagnostics = request_diagnostics
+            raise
 
         # 构建基础生成参数字典
         gen_params: dict = {}
@@ -915,7 +1007,9 @@ class APIClient:
                                 max_tokens=max_tokens,
                                 gen_params=_req_params,
                                 stripped_optional=_stripped_optional,
+                                _request_diagnostics=request_diagnostics,
                             )
+                            response.request_diagnostics = request_diagnostics
                             return response
 
                         if self._is_responses:
@@ -925,7 +1019,9 @@ class APIClient:
                                 max_tokens=max_tokens,
                                 gen_params=_req_params,
                                 stripped_optional=_stripped_optional,
+                                _request_diagnostics=request_diagnostics,
                             )
+                            response.request_diagnostics = request_diagnostics
                             return response
 
                         # 只保留白名单内参数
@@ -1017,13 +1113,20 @@ class APIClient:
                             for _k in ('temperature', 'top_p',
                                        'presence_penalty', 'frequency_penalty'):
                                 _filtered.pop(_k, None)
-                        response = self._client.chat.completions.create(
-                            model=_current_model,
-                            messages=messages,
-                            extra_body=_extra if _extra else None,
-                            **_filtered,
-                        )
+                        # SDK 的 extra_body 覆盖同名顶层字段，诊断按相同顺序合并后取白名单。
+                        with _request_diagnostic(
+                            request_diagnostics, model=_current_model, protocol='openai',
+                            params={**_filtered, **_extra},
+                        ) as diagnostic:
+                            response = self._client.chat.completions.create(
+                                model=_current_model,
+                                messages=messages,
+                                extra_body=_extra if _extra else None,
+                                **_filtered,
+                            )
+                            diagnostic['response_model'] = getattr(response, 'model', None)
 
+                        response.request_diagnostics = request_diagnostics
                         return response
 
                     except Exception as e:
@@ -1063,6 +1166,9 @@ class APIClient:
                 f"API 调用失败：所有模型配额耗尽或重试失败。"
                 f"模型链={_model_chain}，最后错误: {last_error}"
             )
+        except Exception as e:
+            e.request_diagnostics = request_diagnostics
+            raise
         finally:
             # 无论成功返回还是抛异常，都停掉心跳线程
             heartbeat_stop.set()
@@ -1121,7 +1227,8 @@ class APIClient:
     # ---------- Anthropic messages 协议 ----------
 
     def _chat_anthropic(self, *, model: str, messages: list[dict], max_tokens: int,
-                        gen_params: dict, stripped_optional: bool = False):
+                        gen_params: dict, stripped_optional: bool = False,
+                        _request_diagnostics: list | None = None):
         """调用 Anthropic Messages API（/v1/messages）。
 
         用于 PackyAPI 等中转的 claude 模型（仅支持 anthropic 协议，chat/completions 返回
@@ -1208,44 +1315,50 @@ class APIClient:
             wlog(f"{log_prefix()}  [Anthropic] POST {url} model={model} max_tokens={max_tokens} "
                  f"messages={len(anthropic_messages)} system={len(system_prompt)}字符")
 
-        resp = _sess.post(url, json=body, headers=headers, timeout=timeout)
-        if resp.status_code != 200:
-            # 包装为异常，让外层重试/参数剔除/配额识别逻辑复用
-            msg = resp.text[:500]
-            raise _AnthropicAPIError(resp.status_code, msg)
+        with _request_diagnostic(
+            _request_diagnostics, model=model, protocol='anthropic', params=body,
+        ) as diagnostic:
+            resp = _sess.post(url, json=body, headers=headers, timeout=timeout)
+            if resp.status_code != 200:
+                # 包装为异常，让外层重试/参数剔除/配额识别逻辑复用
+                msg = resp.text[:500]
+                raise _AnthropicAPIError(resp.status_code, msg)
 
-        data = resp.json()
-        # 提取文本
-        text = ''
-        for block in data.get('content', []) or []:
-            if block.get('type') == 'text':
-                text += block.get('text', '')
-        usage = data.get('usage') or {}
-        input_tokens = usage.get('input_tokens', 0)
-        output_tokens = usage.get('output_tokens', 0)
-        # cache 统计（Anthropic cache_read_input_tokens / cache_creation_input_tokens）。
-        # 注意 Anthropic 口径与 OpenAI 不同：input_tokens 仅指未缓存部分，
-        # 总输入 = input + read + write。旧代码按 OpenAI 口径相减，
-        # 缓存命中大时算出负数 miss（如实测 miss=-90），污染费用统计。
-        cache_read = usage.get('cache_read_input_tokens', 0) or 0
-        cache_write = usage.get('cache_creation_input_tokens', 0) or 0
-        try:
-            cache_read = max(0, int(cache_read))
-            cache_write = max(0, int(cache_write))
-            input_tokens = max(0, int(input_tokens or 0))
-        except (TypeError, ValueError):
-            cache_read, cache_write = 0, 0
-        hit = cache_read
-        prompt_total = input_tokens + cache_read + cache_write
-        miss = max(0, prompt_total - hit)
-        stop_reason = data.get('stop_reason') or 'end_turn'
+            data = resp.json()
+            diagnostic['response_model'] = data.get('model')
+            # 提取文本
+            text = ''
+            for block in data.get('content', []) or []:
+                if block.get('type') == 'text':
+                    text += block.get('text', '')
+            usage = data.get('usage') or {}
+            input_tokens = usage.get('input_tokens', 0)
+            output_tokens = usage.get('output_tokens', 0)
+            # cache 统计（Anthropic cache_read_input_tokens / cache_creation_input_tokens）。
+            # 注意 Anthropic 口径与 OpenAI 不同：input_tokens 仅指未缓存部分，
+            # 总输入 = input + read + write。旧代码按 OpenAI 口径相减，
+            # 缓存命中大时算出负数 miss（如实测 miss=-90），污染费用统计。
+            cache_read = usage.get('cache_read_input_tokens', 0) or 0
+            cache_write = usage.get('cache_creation_input_tokens', 0) or 0
+            try:
+                cache_read = max(0, int(cache_read))
+                cache_write = max(0, int(cache_write))
+                input_tokens = max(0, int(input_tokens or 0))
+            except (TypeError, ValueError):
+                cache_read, cache_write = 0, 0
+            hit = cache_read
+            prompt_total = input_tokens + cache_read + cache_write
+            miss = max(0, prompt_total - hit)
+            stop_reason = data.get('stop_reason') or 'end_turn'
 
-        return _CompatResponse(text, prompt_total, hit, miss, output_tokens, finish_reason=stop_reason)
+            return _CompatResponse(text, prompt_total, hit, miss, output_tokens,
+                                   finish_reason=stop_reason, model=data.get('model'))
 
     # ---------- OpenAI Responses 协议 ----------
 
     def _chat_responses(self, *, model: str, messages: list[dict], max_tokens: int,
-                        gen_params: dict, stripped_optional: bool = False):
+                        gen_params: dict, stripped_optional: bool = False,
+                        _request_diagnostics: list | None = None):
         """调用 OpenAI Responses API（/v1/responses）。
 
         用于 opencode Zen 网关等只支持 responses 协议的模型（如 muse-spark-1.2-contributor，
@@ -1337,61 +1450,66 @@ class APIClient:
             wlog(f"{log_prefix()}  [Responses] POST {url} model={model} max_output_tokens={_out_tokens} "
                  f"input={len(input_items)} instructions={len(system_prompt)}字符")
 
-        resp = _sess.post(url, json=body, headers=headers, timeout=timeout)
-        if resp.status_code != 200:
-            msg = resp.text[:500]
-            raise _AnthropicAPIError(resp.status_code, msg)
+        with _request_diagnostic(
+            _request_diagnostics, model=model, protocol='responses', params=body,
+        ) as diagnostic:
+            resp = _sess.post(url, json=body, headers=headers, timeout=timeout)
+            if resp.status_code != 200:
+                msg = resp.text[:500]
+                raise _AnthropicAPIError(resp.status_code, msg)
 
-        data = resp.json()
-        # 提取翻译文本：output 数组里 type=='message' 的 item，其 content 中 type=='output_text' 的 text
-        text = ''
-        for item in data.get('output', []) or []:
-            if item.get('type') != 'message':
-                continue
-            for block in item.get('content', []) or []:
-                if block.get('type') == 'output_text':
-                    text += block.get('text', '')
-        # 若 message 块里没有 output_text（罕见），回退拼接 message 的 content 字符串
-        if not text:
+            data = resp.json()
+            diagnostic['response_model'] = data.get('model')
+            # 提取翻译文本：output 数组里 type=='message' 的 item，其 content 中 type=='output_text' 的 text
+            text = ''
             for item in data.get('output', []) or []:
-                if item.get('type') == 'message':
-                    for block in item.get('content', []) or []:
-                        if isinstance(block, str):
-                            text += block
-        # 极端兜底：无 message item 时，尝试拼接 reasoning item 的 summary（思维链摘要）
-        if not text:
-            for item in data.get('output', []) or []:
-                if item.get('type') == 'reasoning':
-                    _summary = item.get('summary') or []
-                    for _s in _summary:
-                        if isinstance(_s, str):
-                            text += _s
-                        elif isinstance(_s, dict):
-                            text += _s.get('text', '')
-        usage = data.get('usage') or {}
-        input_tokens = usage.get('input_tokens', 0)
-        output_tokens = usage.get('output_tokens', 0)
-        # cache 统计：input_tokens_details.cached_tokens（官方文档确认字段）
-        hit = 0
-        _details = usage.get('input_tokens_details') or {}
-        if isinstance(_details, dict):
-            hit = _details.get('cached_tokens', 0) or 0
-        miss = (input_tokens - hit) if input_tokens else 0
-        # 思维链 token：output_tokens_details.reasoning_tokens（官方文档确认字段，
-        # 已计入 output_tokens；transit 网关可能不返回，缺省 0）
-        _reasoning = 0
-        _o_details = usage.get('output_tokens_details') or {}
-        if isinstance(_o_details, dict):
-            try:
-                _reasoning = int(_o_details.get('reasoning_tokens', 0) or 0)
-            except (TypeError, ValueError):
-                _reasoning = 0
-        stop_reason = data.get('status') or 'completed'
-        if stop_reason == 'completed':
-            stop_reason = 'stop'
+                if item.get('type') != 'message':
+                    continue
+                for block in item.get('content', []) or []:
+                    if block.get('type') == 'output_text':
+                        text += block.get('text', '')
+            # 若 message 块里没有 output_text（罕见），回退拼接 message 的 content 字符串
+            if not text:
+                for item in data.get('output', []) or []:
+                    if item.get('type') == 'message':
+                        for block in item.get('content', []) or []:
+                            if isinstance(block, str):
+                                text += block
+            # 极端兜底：无 message item 时，尝试拼接 reasoning item 的 summary（思维链摘要）
+            if not text:
+                for item in data.get('output', []) or []:
+                    if item.get('type') == 'reasoning':
+                        _summary = item.get('summary') or []
+                        for _s in _summary:
+                            if isinstance(_s, str):
+                                text += _s
+                            elif isinstance(_s, dict):
+                                text += _s.get('text', '')
+            usage = data.get('usage') or {}
+            input_tokens = usage.get('input_tokens', 0)
+            output_tokens = usage.get('output_tokens', 0)
+            # cache 统计：input_tokens_details.cached_tokens（官方文档确认字段）
+            hit = 0
+            _details = usage.get('input_tokens_details') or {}
+            if isinstance(_details, dict):
+                hit = _details.get('cached_tokens', 0) or 0
+            miss = (input_tokens - hit) if input_tokens else 0
+            # 思维链 token：output_tokens_details.reasoning_tokens（官方文档确认字段，
+            # 已计入 output_tokens；transit 网关可能不返回，缺省 0）
+            _reasoning = 0
+            _o_details = usage.get('output_tokens_details') or {}
+            if isinstance(_o_details, dict):
+                try:
+                    _reasoning = int(_o_details.get('reasoning_tokens', 0) or 0)
+                except (TypeError, ValueError):
+                    _reasoning = 0
+            stop_reason = data.get('status') or 'completed'
+            if stop_reason == 'completed':
+                stop_reason = 'stop'
 
-        return _CompatResponse(text, input_tokens, hit, miss, output_tokens,
-                               reasoning_tokens=_reasoning, finish_reason=stop_reason)
+            return _CompatResponse(text, input_tokens, hit, miss, output_tokens,
+                                   reasoning_tokens=_reasoning, finish_reason=stop_reason,
+                                   model=data.get('model'))
 
     # ---------- token 统计提取（统一 helper，供调用方复用） ----------
 

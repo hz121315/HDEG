@@ -324,7 +324,8 @@ def harmonize_worldview_with_llm(engine, worldview: dict, verbose: bool = False,
             为空时使用纯内置规则。
 
     返回:
-        (和谐后的世界观 dict, token_stats)；失败（API 异常/JSON 解析失败/结构校验失败）返回 (None, token_stats)
+        (和谐后的世界观 dict, token_stats)；失败（API 异常/JSON 解析失败/结构校验失败）返回 (None, token_stats)。
+        失败诊断放在 token_stats['failure_info']，包含 reason、raw 和 request_diagnostics。
     """
     import json as _json
 
@@ -342,6 +343,7 @@ def harmonize_worldview_with_llm(engine, worldview: dict, verbose: bool = False,
         system_prompt = HARMONIZE_SYSTEM_PROMPT
 
     token_stats: dict = {}
+    raw_output = ''
     try:
         raw_output, token_stats = engine.call_api(
             system_prompt, user_prompt,
@@ -349,29 +351,54 @@ def harmonize_worldview_with_llm(engine, worldview: dict, verbose: bool = False,
         )
     except Exception as e:
         print(f"    ⚠ 世界观和谐化请求失败: {e}", flush=True)
+        # 保持双返回值契约，API 未正常返回时从异常取请求诊断。
+        token_stats['failure_info'] = {
+            'reason': f'API 调用异常: {e}', 'raw': raw_output,
+            'request_diagnostics': getattr(e, 'request_diagnostics', []),
+        }
         return None, token_stats
 
     if not raw_output or not raw_output.strip():
         print("    ⚠ 世界观和谐化返回为空", flush=True)
+        token_stats['failure_info'] = {
+            'reason': '世界观和谐化返回为空', 'raw': raw_output,
+            'request_diagnostics': token_stats.get('request_diagnostics', []),
+        }
         return None, token_stats
 
     json_match = re.search(r'\{.*\}', raw_output, re.DOTALL)
     if not json_match:
         print(f"    ⚠ 世界观和谐化未返回 JSON（前200字: {raw_output[:200]}）", flush=True)
+        token_stats['failure_info'] = {
+            'reason': '世界观和谐化未返回 JSON', 'raw': raw_output,
+            'request_diagnostics': token_stats.get('request_diagnostics', []),
+        }
         return None, token_stats
     try:
         result = _json.loads(json_match.group())
     except _json.JSONDecodeError as e:
         print(f"    ⚠ 世界观和谐化 JSON 解析错误: {e}", flush=True)
+        token_stats['failure_info'] = {
+            'reason': f'JSON 解析错误: {e}', 'raw': raw_output,
+            'request_diagnostics': token_stats.get('request_diagnostics', []),
+        }
         return None, token_stats
 
     if not isinstance(result, dict):
         print("    ⚠ 世界观和谐化结果不是 JSON 对象", flush=True)
+        token_stats['failure_info'] = {
+            'reason': '世界观和谐化结果不是 JSON 对象', 'raw': raw_output,
+            'request_diagnostics': token_stats.get('request_diagnostics', []),
+        }
         return None, token_stats
 
     # 结构校验：至少要保留 characters（后续降级级别依赖它）；空结果视为失败
     if not result.get('characters') and not result.get('worldview'):
         print("    ⚠ 世界观和谐化结果为空内容，视为失败", flush=True)
+        token_stats['failure_info'] = {
+            'reason': '世界观和谐化结果为空内容', 'raw': raw_output,
+            'request_diagnostics': token_stats.get('request_diagnostics', []),
+        }
         return None, token_stats
 
     if verbose:
@@ -488,7 +515,7 @@ def analyze_worldview_with_llm(engine, samples: list[str], verbose: bool = False
             只输出 JSON）始终保留，无需在自定义文件中重复。为空时使用纯内置规则。
 
     返回: (世界观字典, token_stats, fail_info)
-        fail_info: 失败时的诊断信息 dict {'reason', 'raw'}；成功时为 {}。
+        fail_info: 失败时的诊断信息 dict {'reason', 'raw', 'request_diagnostics'}；成功时为 {}。
         raw 为模型原始返回（拒答时通常是拒绝话术文本，写失败日志用）。
     """
     import json as _json
@@ -506,6 +533,8 @@ def analyze_worldview_with_llm(engine, samples: list[str], verbose: bool = False
         print(f"    [DEBUG] 发送给 LLM 的文本长度: {len(content)} 字符", flush=True)
     print(f"    [世界观分析] 正在调用 LLM...", flush=True)
 
+    token_stats: dict = {}
+    raw_output = ''
     try:
         system_prompt = ("你是精通日语成人向虚构音声作品的分析专家。"
                          "请严格按照JSON格式输出分析结果，不要输出任何其他内容。")
@@ -520,21 +549,37 @@ def analyze_worldview_with_llm(engine, samples: list[str], verbose: bool = False
         if json_match:
             try:
                 result = _json.loads(json_match.group())
+                if not result:
+                    print("    ⚠ 世界观分析结果为空内容，视为失败", flush=True)
+                    return {}, token_stats, {
+                        'reason': '世界观分析结果为空内容', 'raw': raw_output,
+                        'request_diagnostics': token_stats.get('request_diagnostics', []),
+                    }
                 print(f"    [世界观分析] 完成!", flush=True)
                 print(f"      世界观: {result.get('worldview', '')[:100]}...", flush=True)
                 print(f"      角色: {len(result.get('characters', []))} 个", flush=True)
                 return result, token_stats, {}
             except _json.JSONDecodeError as e:
                 print(f"    ⚠ JSON 解析错误: {e}", flush=True)
-                return {}, token_stats, {'reason': f'JSON 解析错误: {e}', 'raw': raw_output}
+                return {}, token_stats, {
+                    'reason': f'JSON 解析错误: {e}', 'raw': raw_output,
+                    'request_diagnostics': token_stats.get('request_diagnostics', []),
+                }
         else:
             print(f"    ⚠ 未找到 JSON 格式内容", flush=True)
-            return {}, token_stats, {'reason': '未返回 JSON 格式内容（可能被内容策略拒绝）',
-                                     'raw': raw_output}
+            return {}, token_stats, {
+                'reason': '未返回 JSON 格式内容（可能被内容策略拒绝）', 'raw': raw_output,
+                'request_diagnostics': token_stats.get('request_diagnostics', []),
+            }
 
     except Exception as e:
         print(f"    ⚠ 世界观分析失败: {e}", flush=True)
-        return {}, {}, {'reason': f'API 调用异常: {e}', 'raw': ''}
+        # 解析或结果处理异常时保留已取得的用量、原始响应及请求诊断。
+        return {}, token_stats, {
+            'reason': f'API 调用异常: {e}', 'raw': raw_output,
+            'request_diagnostics': token_stats.get(
+                'request_diagnostics', getattr(e, 'request_diagnostics', [])),
+        }
 
 
 # ==================== FreeTalk 检测 ====================

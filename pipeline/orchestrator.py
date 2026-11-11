@@ -2037,7 +2037,9 @@ def _analyze_work_terms(work_dir: Path, ctx: PipelineContext) -> tuple[dict, lis
                                 _write_worldview_failure_log(work_dir, wv_fail)
                     except Exception as e:
                         _log(f"  [世界观] 分析异常: {e}")
-                        _write_worldview_failure_log(work_dir, {'reason': f'分析异常: {e}', 'raw': ''})
+                        _write_worldview_failure_log(work_dir, {
+                            'reason': f'分析异常: {e}', 'raw': '',
+                            'request_diagnostics': getattr(e, 'request_diagnostics', [])})
                 else:
                     _log(f"  [世界观] 未配置 API Key，跳过")
             else:
@@ -2325,9 +2327,11 @@ def _ensure_harmonized_worldview(ctx: PipelineContext, wkey: str, worldview: dic
                 extra_system_prompt=_load_harmonize_prompt(ctx))
         except Exception as e:
             _log(f"  [和谐] 世界观和谐化异常: {e}", console=True)
-            harmonized, h_token_stats = None, {}
+            harmonized, h_token_stats = None, {
+                'failure_info': {'reason': f'和谐化异常: {e}', 'raw': '',
+                                 'request_diagnostics': getattr(e, 'request_diagnostics', [])}}
         # token 统计（无论成败都记，费用已实际发生）
-        if h_token_stats:
+        if any(k in h_token_stats for k in ('prompt_tokens', 'hit_tokens', 'completion_tokens')):
             _h_cost = ctx.tracker.compute_cost(
                 h_token_stats.get('hit_tokens', 0),
                 h_token_stats.get('miss_tokens', 0),
@@ -2353,13 +2357,39 @@ def _ensure_harmonized_worldview(ctx: PipelineContext, wkey: str, worldview: dic
             _char_n = len(_chars) if isinstance(_chars, (list, dict)) else 0
             _log(f"  [和谐] 和谐版世界观已保存: {hpath.name}（{_char_n} 个角色）")
             return harmonized
+        _write_worldview_failure_log(work_dir, h_token_stats.get('failure_info') or {
+            'reason': '和谐化未产出有效世界观', 'raw': '',
+            'request_diagnostics': h_token_stats.get('request_diagnostics', [])}, purpose='harmonize')
         _log(f"  [和谐] 世界观和谐化失败，跳过依赖和谐版的降级级别", console=True)
         return None
 
 
+def _format_request_diagnostics(records: list | None) -> list[str]:
+    """格式化实际发送诊断；无记录时明确未知，不从当前共享配置猜测模型设置。"""
+    import json
+    if not records:
+        return ['请求诊断: 不可用（未采集到实际发送记录）']
+    lines = []
+    for i, record in enumerate(records, 1):
+        lines.extend([
+            f"请求记录 {i}（块: {record.get('chunk', '-')}，尝试: {record.get('attempt', '-')}）",
+            f"  请求开始: {record.get('started_at', '未知')}",
+            f"  请求结束: {record.get('ended_at', '未知')}，耗时: {record.get('elapsed', '未知')} 秒",
+            f"  请求模型: {record.get('requested_model') or '未知'}",
+            f"  响应模型（服务端声明）: {record.get('response_model') or '未返回'}",
+            f"  协议: {record.get('protocol') or '未知'}",
+            ('  记录粒度: SDK 调用（可能包含 SDK 内部 HTTP 重试）'
+             if record.get('scope') == 'sdk_call' else '  记录粒度: HTTP 请求'),
+            '  实际发送设置（未列出的参数未显式发送）: ' +
+            json.dumps(record.get('settings') or {}, ensure_ascii=False, sort_keys=True),
+        ])
+    return lines
+
+
 def _write_translate_failure_log(lrc_path: Path, ctx: PipelineContext,
                                  attempt_desc: str, reason: str,
-                                 raw_excerpt: str = '') -> None:
+                                 raw_excerpt: str = '',
+                                 request_diagnostics: list | None = None) -> None:
     """翻译（或和谐化）请求失败时，向音频所在目录 log/<音频同名>.log 追加一条记录。
 
     同一音频多次失败记录在同一文件中，每条带时间戳与请求序号分隔。
@@ -2373,6 +2403,7 @@ def _write_translate_failure_log(lrc_path: Path, ctx: PipelineContext,
         parts = [f"\n{'═' * 56}",
                  f"[{_ts}] {attempt_desc}",
                  f"失败原因: {reason}"]
+        parts.extend(_format_request_diagnostics(request_diagnostics))
         if raw_excerpt:
             parts.append(f"API 原始返回（截断 {min(len(raw_excerpt), 4000)} 字）:")
             parts.append(raw_excerpt[:4000])
@@ -2382,8 +2413,9 @@ def _write_translate_failure_log(lrc_path: Path, ctx: PipelineContext,
         _log(f"  [失败日志] 写入失败: {e}")
 
 
-def _write_worldview_failure_log(work_dir: Path, fail_info: dict) -> None:
-    """世界观生成失败日志：追加到 <作品根>/log/worldview.log。
+def _write_worldview_failure_log(work_dir: Path, fail_info: dict,
+                                 purpose: str = 'worldview') -> None:
+    """世界观分析/和谐化失败：追加到作品根 log/worldview.log 或 log/harmonize.log。
 
     多次失败记录在同一文件（含时间戳分隔），记录原因与 API 原始返回
     （拒答时通常是拒绝话术）。写入失败只提示，不影响主流程。
@@ -2391,12 +2423,13 @@ def _write_worldview_failure_log(work_dir: Path, fail_info: dict) -> None:
     try:
         log_dir = Path(work_dir) / 'log'
         log_dir.mkdir(parents=True, exist_ok=True)
-        log_file = log_dir / 'worldview.log'
+        log_file = log_dir / ('harmonize.log' if purpose == 'harmonize' else 'worldview.log')
+        _tag = '世界观和谐化' if purpose == 'harmonize' else '世界观生成'
         _ts = time.strftime('%Y-%m-%d %H:%M:%S')
         parts = [f"\n{'═' * 56}",
-                 f"[{_ts}] 世界观生成失败（{Path(work_dir).name}）",
-                 f"失败原因: {fail_info.get('reason', '未知')}",
-                 f"提示: 翻译失败降级时将尝试从 ASR 样本直接生成和谐版世界观"]
+                 f"[{_ts}] {_tag}失败（{Path(work_dir).name}）",
+                 f"失败原因: {fail_info.get('reason', '未知')}"]
+        parts.extend(_format_request_diagnostics(fail_info.get('request_diagnostics')))
         raw = (fail_info.get('raw') or '').strip()
         if raw:
             parts.append(f"API 原始返回（截断 {min(len(raw), 4000)} 字）:")
@@ -2591,6 +2624,7 @@ def translate_one_lrc(
         _p_reason_preview = ''
         _p_fail_reason = ''
         _p_fail_raw = ''
+        _p_diagnostics = []
         _p_start = time.time()
         for _ci, _chunk_idx in enumerate(_chunks):
             _chunk_numbered = [numbered[i] for i in _chunk_idx]
@@ -2620,7 +2654,11 @@ def translate_one_lrc(
             except Exception as _tx_e:
                 # API 调用抛异常（网络/模型/超时/内容策略拒绝）：本级立即失败
                 _p_fail_reason = f"[翻译调用异常] {_tx_e}"
+                _p_diagnostics.extend(dict(d, chunk=_ci + 1) for d in
+                                      (getattr(_tx_e, 'request_diagnostics', []) or []))
                 break
+            _p_diagnostics.extend(dict(d, chunk=_ci + 1) for d in
+                                  (result.get('request_diagnostics') or []))
             _call_elapsed = time.time() - _call_start
             try:
                 _p_fr.append(result.get('finish_reason'))
@@ -2673,6 +2711,7 @@ def translate_one_lrc(
             'ok': not _p_fail_reason,
             'reason': _p_fail_reason,
             'raw': _p_fail_raw,
+            'request_diagnostics': _p_diagnostics,
             'translated': _p_translated,
             'hit': _p_hit, 'miss': _p_miss, 'prompt': _p_prompt,
             'comp': _p_comp, 'cost': _p_cost, 'reasoning': _p_reasoning,
@@ -2750,7 +2789,8 @@ def translate_one_lrc(
         if _pass_res.get('reason_preview'):
             _log(f"  [异常翻译] 思维链预览: {_pass_res['reason_preview'][:500]}")
         if _fallback_on:
-            _write_translate_failure_log(lrc_path, ctx, _lv_desc, _pass_res['reason'], _pass_res['raw'])
+            _write_translate_failure_log(lrc_path, ctx, _lv_desc, _pass_res['reason'],
+                                         _pass_res['raw'], _pass_res['request_diagnostics'])
 
         # 第1级失败后首次触发和谐版生成（同组其他音轨已生成时直接复用文件）
         if _lv == 1 and _fallback_on and not _harmonized_tried:

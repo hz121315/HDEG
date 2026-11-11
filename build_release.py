@@ -498,19 +498,23 @@ def copy_config():
     with open(config_src, 'r', encoding='utf-8') as f:
         config = json.load(f)
     
-    # 抹去 API key（含 presets 内各服务商的 key）
-    if "api" in config:
-        if "key" in config["api"]:
-            original_key = config["api"]["key"]
-            config["api"]["key"] = ""
-            print(f"  抹去 API key: {str(original_key)[:10]}... -> (空)")
-        # 预设中的 key 也需清空
-        presets = config["api"].get("presets")
-        if isinstance(presets, dict):
-            for pname, pval in presets.items():
-                if isinstance(pval, dict) and "key" in pval and pval["key"]:
-                    pval["key"] = ""
-                    print(f"  抹去 preset[{pname}].key -> (空)")
+    # 清空全部 API 配置层级的凭证，包含独立 worldview/harmonize、预设及注册表。
+    # 发布时不打印凭证前缀，避免构建日志也泄露 key。
+    def clear_credentials(value):
+        if isinstance(value, dict):
+            for name, item in value.items():
+                normalized = name.lower().replace('-', '_')
+                if normalized in {'key', 'api_key', 'apikey', 'token', 'access_token',
+                                  'authorization', 'password', 'secret'}:
+                    value[name] = ''
+                else:
+                    clear_credentials(item)
+        elif isinstance(value, list):
+            for item in value:
+                clear_credentials(item)
+
+    clear_credentials(config.get('api', {}))
+    print('  已清空各 API 配置层级的凭证')
     
     # 关闭 debug（用户默认只看错误 + 进度，不要全量详情）
     if "app" in config:
