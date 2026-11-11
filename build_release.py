@@ -175,6 +175,14 @@ def run_pyinstaller():
     #     else:
     #         print("  ⚠ 未找到 PaddleOCR 模型目录，OCR 功能将需要联网下载模型")
     
+    # 内置翻译提示词随 exe 打包：frozen 时从 _MEIPASS 读取，
+    # 作为发布目录 prompts/translation.txt 缺失或不可读时的兜底
+    _tr_prompt = SCRIPT_DIR / "prompts" / "translation.txt"
+    if _tr_prompt.exists():
+        cmd.extend(["--add-data", f"{_tr_prompt};prompts"])
+    else:
+        print("  ⚠ 未找到 prompts/translation.txt，打包后无内置翻译提示词兜底")
+
     cmd.append("main.py")
     
     print(f"执行命令: {' '.join(cmd)}")
@@ -672,12 +680,19 @@ def copy_config():
         hm_file = prompts_dir / "harmonize.txt"
         wv_file.write_text(WORLDVIEW_ANALYSIS_RULES_PROMPT, encoding='utf-8')
         hm_file.write_text(HARMONIZE_RULES_PROMPT, encoding='utf-8')
-        # config 默认指向这两个文件（相对路径，相对进程 CWD，与 exe 同目录时直接命中）
+        # 翻译内置 prompt：从仓库 prompts/translation.txt 复制到发布目录，供用户直接编辑
+        tr_src = SCRIPT_DIR / "prompts" / "translation.txt"
+        if tr_src.exists():
+            shutil.copy2(tr_src, prompts_dir / "translation.txt")
+            config["prompts"]["system_prompt_file"] = "prompts/translation.txt"
+        else:
+            print("  ⚠ 未找到 prompts/translation.txt，翻译提示词仍使用 exe 内嵌副本")
+        # config 默认指向这三个文件（相对路径，相对进程 CWD；程序目录兜底解析）
         config["prompts"]["worldview_system_prompt_file"] = "prompts/worldview.txt"
         config["prompts"]["harmonize_system_prompt_file"] = "prompts/harmonize.txt"
         with open(config_dst, 'w', encoding='utf-8') as f:
             json.dump(config, f, ensure_ascii=False, indent=2)
-        print(f"OK prompts/ 已生成并默认引用: {wv_file.name}, {hm_file.name}")
+        print(f"OK prompts/ 已生成并默认引用: {wv_file.name}, {hm_file.name}, translation.txt")
     except Exception as e:
         print(f"  ⚠ prompts/ 目录生成失败（使用内置规则）: {e}")
     print()

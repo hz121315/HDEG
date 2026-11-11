@@ -46,6 +46,8 @@ nul
 *.txt
 !使用说明.txt
 !requirements.txt
+# 提示词文本（源码/发布共用，需入库）
+!prompts/*.txt
 
 # Markdown文件（仅允许 README 入库）
 *.md

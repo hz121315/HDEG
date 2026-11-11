@@ -71,6 +71,29 @@
 - 测试：`tests/test_nsfw_fallback.py` 更新 1 项+新增 4 项（prompt 拆分断言、fail_info、worldview 引擎/失败日志、双键独立），
   全量 72 passed。
 
+## 2026-11-11 翻译内置 system prompt 抽离为 prompts/translation.txt
+
+- 新增仓库根 `prompts/translation.txt`：内容为原 `translate_engine.py` build_system_prompt 中
+  `else:` 分支的 13 个板块（角色定位/角色名规则/台本优先级/terms·alias/工作流程/内容安全/
+  人称约束/身体部位/忠实度/标点规范），AST 比对确认与代码内置段逐字一致。
+- `translate_engine.py`：删除硬编码长字符串，新增 `load_builtin_translation_prompt()`
+  （模块级缓存；frozen 优先 `_MEIPASS/prompts/translation.txt`，其次 exe 目录；源码用仓库根），
+  加载失败告警一次并返回空串。`system_prompt_file` 的相对路径在 CWD 找不到时按程序目录兜底。
+- `build_release.py`：发布目录复制 `prompts/translation.txt` 并令 config `system_prompt_file`
+  默认指向它；PyInstaller `--add-data prompts/translation.txt;prompts` 内嵌作为兜底。
+- `config.example.json` / 本地 config 同步默认值。
+- 新增 `tests/test_translation_prompt.py` 4 项（文件加载/内置使用/外部替换/CWD 兜底），全量 76 passed。
+
+## 2026-11-11 台本/标点规则写死内置
+
+- `translate_engine.py` 新增模块常量 `TRANSLATION_BUILTIN_SCRIPTBOOK_RULES`、`TRANSLATION_BUILTIN_PUNCTUATION_RULES`，
+  `build_system_prompt` 在基础段（文件或内置）之后**始终**追加，不被 `system_prompt_file` 替换。
+- `prompts/translation.txt` 移除上述两节（避免重复），文件只保留可自定义基础设定（9 个板块 + 开场角色定位）。
+  删除前用归一化比对确认两节文本与内置常量逐字一致。
+- 结果：自定义翻译 prompt 无法移除台本优先级/字幕标点规范；JSON 契约仍在 user prompt，不受影响。
+- 测试：`tests/test_translation_prompt.py` 更新 4 项 + 新增 1 项（内置机械规则内容、外部替换仍保留内置规则），全量 77 passed。
+- 文档：`使用说明.md` 的 prompts 小节更新组装公式与写作要点。
+
 ## 环境与打包经历（非业务代码变更）
 
 - 最初 GitHub 直连失败，先下载快照，后重试取得 Git 仓库；后续 origin 指向用户仓库 hz121315/HDEG。

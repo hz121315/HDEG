@@ -3,7 +3,7 @@ from PyInstaller.utils.hooks import collect_data_files
 from PyInstaller.utils.hooks import collect_submodules
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('C:/Users/Administrator/IdeaProjects/HDEG/.venv/lib/site-packages/pyopenjtalk/open_jtalk_dic_utf_8-1.11', 'pyopenjtalk/open_jtalk_dic_utf_8-1.11')]
+datas = [('C:/Users/Administrator/IdeaProjects/HDEG/.venv/lib/site-packages/pyopenjtalk/open_jtalk_dic_utf_8-1.11', 'pyopenjtalk/open_jtalk_dic_utf_8-1.11'), ('C:/Users/Administrator/IdeaProjects/HDEG/prompts/translation.txt', 'prompts')]
 binaries = [('C:/Users/Administrator/IdeaProjects/HDEG/.venv/lib/site-packages/fugashi.libs/libmecab-d8ddc0791437ce8c4a187ae7c69a2f68.dll', 'fugashi.libs')]
 hiddenimports = []
 datas += collect_data_files('unidic_lite')

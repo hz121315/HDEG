@@ -23,6 +23,7 @@
 | api.worldview.{key,base_url,model,protocol} | 空 | 世界观**分析**专用 API；全空时复用翻译 API；与 api.harmonize 相互独立（2026-11-11 新增） |
 | prompts.harmonize_system_prompt_file | 空（发布件指向 prompts/harmonize.txt） | 和谐化自定义规则 prompt（UTF-8）；**替换**内置改写规则部分，内置【输出要求】始终附加；缺失/为空/读取失败回退纯内置（2026-11-10 新增，2026-11-11 语义从"拼接"改为"替换"） |
 | prompts.worldview_system_prompt_file | 空（发布件指向 prompts/worldview.txt） | 世界观分析自定义规则 prompt；同上替换语义（2026-11-11 新增） |
+| prompts.system_prompt_file | prompts/translation.txt（发布件/模板/本地） | 翻译“可自定义基础设定”；台本优先级与字幕标点规范为 `translate_engine.py` 内置常量，**始终追加、不可被文件替换**。文本已抽离为 prompts/translation.txt（源仓库/发布目录/打包内嵌三处同源）。为空或文件缺失时回退 exe 内嵌副本；相对路径先按 CWD、再按程序目录解析。术语/alias/世界观仍由 build_system_prompt 追加（2026-11-11 抽取；同日台本/标点写死内置） |
 | app.api_preflight | true | 请求可用性预检，不是翻译任务 |
 | app.delay_translate_to_offpeak | false | 等待固定定价时段后派发 LLM；不能保证当前服务商半价 |
 
@@ -70,8 +71,8 @@ RJ 正则仍为 `RJ\d{6,}`、忽略大小写、匹配目录名中的子串；本
 ## Prompt/API 保留能力
 
 - api.key、base_url、model、protocol、models 注册表和 generation_params 保留。
-- prompts.system_prompt_file 可替换翻译 system 的基础角色段，术语、alias、世界观仍追加；不覆盖 JSON 格式契约、分析或润色 prompt。
-- 外部 prompt 以 UTF-8 读取；当前相对路径相对进程 CWD，不保证相对 exe 目录，读取失败会静默回退内置提示词。
+- prompts.system_prompt_file 可替换翻译 system 的基础角色段，术语、alias、世界观仍追加；不覆盖 JSON 格式契约、分析或润色 prompt。该基础段已抽离为 `prompts/translation.txt`（源码/发布目录/打包内嵌同源）。
+- 外部 prompt 以 UTF-8 读取；相对路径先按进程 CWD 解析，不存在再按程序目录解析；读取失败回退 `prompts/translation.txt`（exe 内嵌副本）。
 - 翻译 max_tokens_translate 优先于 max_tokens；小于 16384 时代码会抬至 262144，不能把任意小值当成有效限额。
 
 ## 取消或未纳入的候选
