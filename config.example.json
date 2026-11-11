@@ -11,6 +11,12 @@
       "model": "",
       "protocol": ""
     },
+    "worldview": {
+      "key": "",
+      "base_url": "",
+      "model": "",
+      "protocol": ""
+    },
     "models": {
       "muse-spark": {"protocol": "responses", "note": "Zen网关仅支持responses",
         "reasoning": {"style": "effort", "param": "reasoning.effort", "values": ["low", "high"]}},
@@ -248,7 +254,8 @@
   },
   "prompts": {
     "system_prompt_file": "",
-    "harmonize_system_prompt_file": ""
+    "harmonize_system_prompt_file": "",
+    "worldview_system_prompt_file": ""
   },
   "network": {
     "clear_proxy_on_startup": false

@@ -20,7 +20,9 @@
 | app.translate_failed_max_retries | 3 | 音轨级重试轮数；上下文最小钳制为 1 |
 | app.nsfw_fallback_enabled | true | NSFW 多级降级重试总开关（2026-11-10 新增，见下） |
 | api.harmonize.{key,base_url,model,protocol} | 空 | 世界观和谐化专用 API；全空时复用翻译 API（2026-11-10 新增） |
-| prompts.harmonize_system_prompt_file | 空 | 和谐化自定义前置 prompt 文件（UTF-8）；内容拼接在内置 HARMONIZE_SYSTEM_PROMPT 之前，缺失/为空/读取失败回退纯内置（2026-11-10 新增） |
+| api.worldview.{key,base_url,model,protocol} | 空 | 世界观**分析**专用 API；全空时复用翻译 API；与 api.harmonize 相互独立（2026-11-11 新增） |
+| prompts.harmonize_system_prompt_file | 空（发布件指向 prompts/harmonize.txt） | 和谐化自定义规则 prompt（UTF-8）；**替换**内置改写规则部分，内置【输出要求】始终附加；缺失/为空/读取失败回退纯内置（2026-11-10 新增，2026-11-11 语义从"拼接"改为"替换"） |
+| prompts.worldview_system_prompt_file | 空（发布件指向 prompts/worldview.txt） | 世界观分析自定义规则 prompt；同上替换语义（2026-11-11 新增） |
 | app.api_preflight | true | 请求可用性预检，不是翻译任务 |
 | app.delay_translate_to_offpeak | false | 等待固定定价时段后派发 LLM；不能保证当前服务商半价 |
 

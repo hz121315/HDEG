@@ -607,11 +607,19 @@ def copy_config():
             api["harmonize"].setdefault(_hk, "")
         print("  补齐 api.harmonize 占位（空 = 复用翻译 API）")
 
-    # 和谐化自定义前置 prompt 文件路径（空 = 使用内置规则）
+    # 世界观分析专用 API 子段（空值 = 复用翻译 API；显式占位供用户填写）
+    if not isinstance(api.get("worldview"), dict):
+        api["worldview"] = {}
+    for _wk in ("key", "base_url", "model", "protocol"):
+        api["worldview"].setdefault(_wk, "")
+    print("  补齐 api.worldview 占位（空 = 复用翻译 API）")
+
+    # prompt 引用键占位；随后若生成 prompts/ 目录则指向其中文件
     if not isinstance(config.get("prompts"), dict):
         config["prompts"] = {}
     config["prompts"].setdefault("harmonize_system_prompt_file", "")
-    print("  补齐 prompts.harmonize_system_prompt_file 占位")
+    config["prompts"].setdefault("worldview_system_prompt_file", "")
+    print("  补齐 prompts.harmonize/worldview_system_prompt_file 占位")
 
     # 全局代理开关：发布件默认不强制清代理（交给 api.clear_proxy 与系统代理）
     if isinstance(config.get("network"), dict):
@@ -645,8 +653,33 @@ def copy_config():
     
     with open(config_dst, 'w', encoding='utf-8') as f:
         json.dump(config, f, ensure_ascii=False, indent=2)
-    
+
     print(f"OK 处理后的 config.json 已保存到: {config_dst}")
+
+    # ── 生成 prompts/ 目录：导出世界观分析与和谐化改写的规则文本，发布件默认引用 ──
+    # 用户可直接编辑这两个文件调整规则（内置【输出要求】不导出，运行时始终附加，
+    # JSON 结构/name 字段等解析硬依赖不会因编辑而破坏）。
+    try:
+        import sys as _sys
+        if str(SCRIPT_DIR) not in _sys.path:
+            _sys.path.insert(0, str(SCRIPT_DIR))
+        from engines.worldview_engine import (
+            WORLDVIEW_ANALYSIS_RULES_PROMPT, HARMONIZE_RULES_PROMPT,
+        )
+        prompts_dir = RELEASE_DIR / "prompts"
+        prompts_dir.mkdir(parents=True, exist_ok=True)
+        wv_file = prompts_dir / "worldview.txt"
+        hm_file = prompts_dir / "harmonize.txt"
+        wv_file.write_text(WORLDVIEW_ANALYSIS_RULES_PROMPT, encoding='utf-8')
+        hm_file.write_text(HARMONIZE_RULES_PROMPT, encoding='utf-8')
+        # config 默认指向这两个文件（相对路径，相对进程 CWD，与 exe 同目录时直接命中）
+        config["prompts"]["worldview_system_prompt_file"] = "prompts/worldview.txt"
+        config["prompts"]["harmonize_system_prompt_file"] = "prompts/harmonize.txt"
+        with open(config_dst, 'w', encoding='utf-8') as f:
+            json.dump(config, f, ensure_ascii=False, indent=2)
+        print(f"OK prompts/ 已生成并默认引用: {wv_file.name}, {hm_file.name}")
+    except Exception as e:
+        print(f"  ⚠ prompts/ 目录生成失败（使用内置规则）: {e}")
     print()
 
 

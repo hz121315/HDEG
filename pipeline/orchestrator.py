@@ -627,8 +627,9 @@ class PipelineContext:
         #   第1级 完整上下文 → 第2级 和谐版世界观 → 第3级 仅和谐版角色表+术语 → 第4级 纯文本裸翻 → 跳过
         # 关闭时保持旧行为：失败音轨进入轮级重试队列（translate_failed_max_retries）。
         self.nsfw_fallback_enabled = bool(self.app_cfg.get('nsfw_fallback_enabled', True))
-        # 和谐化专用引擎缓存（api.harmonize 配置非空时独立于翻译引擎；懒加载）
+        # 和谐化/世界观分析专用引擎缓存（api.harmonize / api.worldview 非空时独立于翻译引擎；懒加载）
         self._harmonize_engine = None
+        self._worldview_engine = None
         # 按 RJ 组（wkey）的和谐版生成锁：防止同组多音轨并发重复生成
         self._harmonize_locks: dict = {}
         self._harmonize_locks_guard = threading.Lock()
@@ -1988,12 +1989,16 @@ def _analyze_work_terms(work_dir: Path, ctx: PipelineContext) -> tuple[dict, lis
             if samples:
                 total_chars = sum(len(s) for s in samples)
                 _log(f"  [世界观] 抽样 {len(samples)} 个 .ja.lrc 文件, 共 {total_chars} 字符，调用 LLM 分析...")
+                # 世界观分析专用引擎：api.worldview 可单独配置，全空时复用翻译引擎
+                engine = _get_worldview_engine(ctx)
                 api_config = get_api_config(ctx.config)
                 if api_config.get('key') or api_config.get('api_key'):
                     try:
-                        from engines.translate_engine import OpenAICompatEngine
-                        engine = OpenAICompatEngine(api_config, verbose=ctx.pr.debug_enabled, pricing=ctx.pricing)
-                        worldview, wv_token_stats = analyze_worldview_with_llm(engine, samples, verbose=ctx.pr.debug_enabled)
+                        # 自定义分析规则（prompts.worldview_system_prompt_file，可替换内置规则）
+                        _wv_rules = _load_rules_prompt(ctx, 'worldview_system_prompt_file', '世界观')
+                        worldview, wv_token_stats, wv_fail = analyze_worldview_with_llm(
+                            engine, samples, verbose=ctx.pr.debug_enabled,
+                            extra_rules_prompt=_wv_rules)
                         # 统一 token 追踪：记录世界观分析 LLM 调用
                         if wv_token_stats:
                             _wv_cost = ctx.tracker.compute_cost(
@@ -2026,8 +2031,13 @@ def _analyze_work_terms(work_dir: Path, ctx: PipelineContext) -> tuple[dict, lis
                             _inject_worldview_terms(worldview, terms, work_dir)
                         else:
                             _log(f"  [世界观] LLM 分析返回空结果")
+                            if wv_fail:
+                                # 世界观生成失败日志：与翻译失败日志同一目录约定
+                                # （work_dir/log/worldview.log），记录原因与原始返回
+                                _write_worldview_failure_log(work_dir, wv_fail)
                     except Exception as e:
                         _log(f"  [世界观] 分析异常: {e}")
+                        _write_worldview_failure_log(work_dir, {'reason': f'分析异常: {e}', 'raw': ''})
                 else:
                     _log(f"  [世界观] 未配置 API Key，跳过")
             else:
@@ -2173,24 +2183,26 @@ def _enqueue_failed_track(ctx: PipelineContext, task: dict, reason: str) -> None
 
 # ==================== NSFW 多级降级重试辅助 ====================
 
-def _get_harmonize_engine(ctx: PipelineContext):
-    """获取世界观和谐化专用引擎（懒加载，线程安全）。
+def _get_context_engine(ctx: PipelineContext, sub_key: str, cache_attr: str, tag: str):
+    """获取指定用途的 LLM 引擎（懒加载，线程安全，harmonize/worldview 通用）。
 
-    config api.harmonize 的 key/base_url/model 全为空时直接复用翻译引擎；
-    任一非空时深拷贝配置、用非空字段覆盖 api 段对应键后创建独立引擎
-    （models 注册表、generation_params、超时等其余配置全部继承全局）。
+    config api.<sub_key>（如 api.harmonize / api.worldview）的 key/base_url/model
+    全为空时直接复用翻译引擎；任一非空时深拷贝配置、用非空字段覆盖 api 段对应键后
+    创建独立引擎（models 注册表、generation_params、超时等其余配置全部继承全局）。
     """
     with ctx.thread_lock:
-        if ctx._harmonize_engine is not None:
-            return ctx._harmonize_engine
-        h_cfg = (ctx.config.get('api', {}) or {}).get('harmonize') or {}
+        _cached = getattr(ctx, cache_attr, None)
+        if _cached is not None:
+            return _cached
+        h_cfg = (ctx.config.get('api', {}) or {}).get(sub_key) or {}
         if not isinstance(h_cfg, dict):
             h_cfg = {}
         _has_override = any(str(h_cfg.get(k) or '').strip()
                             for k in ('key', 'base_url', 'model'))
         if not _has_override:
-            ctx._harmonize_engine = ctx.translate_engine
-            return ctx._harmonize_engine
+            _engine = ctx.translate_engine
+            setattr(ctx, cache_attr, _engine)
+            return _engine
         import copy as _copy
         merged = _copy.deepcopy(ctx.config)
         api = merged.setdefault('api', {})
@@ -2199,39 +2211,55 @@ def _get_harmonize_engine(ctx: PipelineContext):
             if _v:
                 api[_k] = _v
         from engines.translate_engine import create_translate_engine
-        ctx._harmonize_engine = create_translate_engine(
+        _engine = create_translate_engine(
             api,
             verbose=ctx.pr.debug_enabled,
             pricing=ctx.pricing,
         )
-        _log(f"  [和谐] 使用独立和谐化 API: model={api.get('model')}")
-        return ctx._harmonize_engine
+        _log(f"  [{tag}] 使用独立 API: model={api.get('model')}")
+        setattr(ctx, cache_attr, _engine)
+        return _engine
 
 
-def _load_harmonize_prompt(ctx: PipelineContext) -> str | None:
-    """读取用户自定义的和谐化前置 prompt（config prompts.harmonize_system_prompt_file）。
+def _get_harmonize_engine(ctx: PipelineContext):
+    """获取世界观和谐化专用引擎（api.harmonize，空则复用翻译引擎）。"""
+    return _get_context_engine(ctx, 'harmonize', '_harmonize_engine', '和谐')
 
-    内容会拼接在内置 HARMONIZE_SYSTEM_PROMPT 之前，用于补充内置规则未覆盖的
-    高危类别（如血腥暴力）。文件不存在/读取失败时返回 None（回退纯内置规则），
-    与 prompts.system_prompt_file 的容错先例一致。
+
+def _get_worldview_engine(ctx: PipelineContext):
+    """获取世界观分析专用引擎（api.worldview，空则复用翻译引擎）。"""
+    return _get_context_engine(ctx, 'worldview', '_worldview_engine', '世界观')
+
+
+def _load_rules_prompt(ctx: PipelineContext, config_key: str, tag: str) -> str | None:
+    """读取用户自定义的规则 prompt 文件（UTF-8 文本）。
+
+    用途（worldview=世界观分析规则 / harmonize=和谐化改写规则）：
+    文件内容**替换**对应内置 prompt 的规则部分；内置【输出要求】始终保留。
+    文件不存在/为空/读取失败时返回 None（回退纯内置规则），容错先例同 prompts.system_prompt_file。
     """
-    _p_file = (ctx.config.get('prompts', {}) or {}).get('harmonize_system_prompt_file', '')
+    _p_file = (ctx.config.get('prompts', {}) or {}).get(config_key, '')
     if not _p_file:
         return None
     try:
         _p_path = Path(_p_file)
         if not _p_path.exists():
-            _log(f"  [和谐] 自定义前置 prompt 文件不存在，使用内置规则: {_p_file}")
+            _log(f"  [{tag}] 自定义规则 prompt 文件不存在，使用内置规则: {_p_file}")
             return None
         content = _p_path.read_text(encoding='utf-8')
         if content.strip():
-            _log(f"  [和谐] 已加载自定义前置 prompt: {_p_file}（{len(content)} 字符）")
+            _log(f"  [{tag}] 已加载自定义规则 prompt: {_p_file}（{len(content)} 字符）")
             return content
-        _log(f"  [和谐] 自定义前置 prompt 文件为空，使用内置规则")
+        _log(f"  [{tag}] 自定义规则 prompt 文件为空，使用内置规则")
         return None
     except Exception as e:
-        _log(f"  [和谐] 自定义前置 prompt 读取失败（{e}），使用内置规则")
+        _log(f"  [{tag}] 自定义规则 prompt 读取失败（{e}），使用内置规则")
         return None
+
+
+def _load_harmonize_prompt(ctx: PipelineContext) -> str | None:
+    """读取和谐化自定义规则 prompt（prompts.harmonize_system_prompt_file）。"""
+    return _load_rules_prompt(ctx, 'harmonize_system_prompt_file', '和谐')
 
 
 def _ensure_harmonized_worldview(ctx: PipelineContext, wkey: str, worldview: dict,
@@ -2335,6 +2363,32 @@ def _write_translate_failure_log(lrc_path: Path, ctx: PipelineContext,
             f.write('\n'.join(parts) + '\n')
     except Exception as e:
         _log(f"  [失败日志] 写入失败: {e}")
+
+
+def _write_worldview_failure_log(work_dir: Path, fail_info: dict) -> None:
+    """世界观生成失败日志：追加到 <作品根>/log/worldview.log。
+
+    多次失败记录在同一文件（含时间戳分隔），记录原因与 API 原始返回
+    （拒答时通常是拒绝话术）。写入失败只提示，不影响主流程。
+    """
+    try:
+        log_dir = Path(work_dir) / 'log'
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / 'worldview.log'
+        _ts = time.strftime('%Y-%m-%d %H:%M:%S')
+        parts = [f"\n{'═' * 56}",
+                 f"[{_ts}] 世界观生成失败（{Path(work_dir).name}）",
+                 f"失败原因: {fail_info.get('reason', '未知')}",
+                 f"提示: 翻译失败降级时将尝试从 ASR 样本直接生成和谐版世界观"]
+        raw = (fail_info.get('raw') or '').strip()
+        if raw:
+            parts.append(f"API 原始返回（截断 {min(len(raw), 4000)} 字）:")
+            parts.append(raw[:4000])
+        with open(log_file, 'a', encoding='utf-8') as f:
+            f.write('\n'.join(parts) + '\n')
+        _log(f"  [世界观] 失败日志已写入: {log_file}")
+    except Exception as e:
+        _log(f"  [世界观失败日志] 写入失败: {e}")
 
 
 # ==================== 单文件翻译 ====================

@@ -56,6 +56,21 @@
 - `使用说明.md` / `README.md`：默认参数说明、低显存回退方式；`.trellis parameters.md` 同步记录。
 - auto_tune 代码未动：显式 extra_args 时自动参数已让位，显式 float16 与 ≥10GB 自动改写一致。
 
+## 2026-11-11 世界观分析独立 API/Prompt + 发布件 prompts/ 目录
+
+- `engines/worldview_engine.py`：两个内置 prompt 各拆为「规则部分（可替换）」+「【输出要求】（内置保留）」——
+  `WORLDVIEW_ANALYSIS_RULES_PROMPT`/`WORLDVIEW_ANALYSIS_OUTPUT_REQUIREMENTS`、
+  `HARMONIZE_RULES_PROMPT`/`HARMONIZE_OUTPUT_REQUIREMENTS`，旧常量 `*_SYSTEM_PROMPT`/`WORLDVIEW_ANALYSIS_PROMPT`
+  以拼接形式保留兼容。`harmonize_worldview_with_llm` 自定义语义从"前置拼接"改为"**替换规则部分**"；
+  `analyze_worldview_with_llm` 新增 `extra_rules_prompt` 参数，返回值扩为三元组（含 `fail_info`）。
+- `pipeline/orchestrator.py`：`_get_context_engine` 泛化（harmonize/worldview 通用，api.worldview 接入）；
+  `_load_rules_prompt` 泛化（worldview/harmonize 两键独立）；世界观分析失败写 `<作品根>/log/worldview.log`
+  （原因+原始返回，与翻译失败日志同目录约定）。
+- `build_release.py`：发布件生成 `prompts/` 目录（`worldview.txt`+`harmonize.txt`，导出规则文本），
+  config 默认指向这两个文件；`api.worldview` 占位补齐。
+- 测试：`tests/test_nsfw_fallback.py` 更新 1 项+新增 4 项（prompt 拆分断言、fail_info、worldview 引擎/失败日志、双键独立），
+  全量 72 passed。
+
 ## 环境与打包经历（非业务代码变更）
 
 - 最初 GitHub 直连失败，先下载快照，后重试取得 Git 仓库；后续 origin 指向用户仓库 hz121315/HDEG。

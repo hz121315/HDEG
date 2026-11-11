@@ -351,19 +351,23 @@ def test_harmonize_worldview_with_llm_refuse():
 
 
 def test_harmonize_extra_system_prompt_prepended():
-    """自定义前置 prompt 拼接在内置规则之前，内置格式约束仍在。"""
+    """自定义规则 prompt **替换**内置规则，内置【输出要求】仍保留在后。"""
     from engines.worldview_engine import (
-        HARMONIZE_SYSTEM_PROMPT, harmonize_worldview_with_llm,
+        HARMONIZE_SYSTEM_PROMPT, HARMONIZE_RULES_PROMPT,
+        HARMONIZE_OUTPUT_REQUIREMENTS, harmonize_worldview_with_llm,
     )
+    # 兼容常量：完整内置 = 规则 + 输出要求
+    assert HARMONIZE_SYSTEM_PROMPT == HARMONIZE_RULES_PROMPT + HARMONIZE_OUTPUT_REQUIREMENTS
     extra = '血腥、肢解、酷刑等描写一律改写为"激烈冲突"等温和表述。'
     eng = FakeCallApiEngine(json.dumps(HARMONIZED_WV, ensure_ascii=False))
     result, _ = harmonize_worldview_with_llm(eng, dict(ORIG_WV),
                                              extra_system_prompt=extra)
     assert result == HARMONIZED_WV
     sys_p, _ = eng.prompts[0]
-    assert sys_p.startswith(extra)                  # 前置在前
-    assert HARMONIZE_SYSTEM_PROMPT in sys_p         # 内置规则兜底在后
-    # 空白自定义 → 纯内置
+    assert sys_p.startswith(extra)                          # 自定义规则在前
+    assert HARMONIZE_OUTPUT_REQUIREMENTS in sys_p           # 内置输出要求保留在后
+    assert HARMONIZE_RULES_PROMPT not in sys_p              # 内置规则被替换
+    # 空白自定义 → 纯内置（规则+输出要求）
     eng2 = FakeCallApiEngine(json.dumps(HARMONIZED_WV, ensure_ascii=False))
     harmonize_worldview_with_llm(eng2, dict(ORIG_WV), extra_system_prompt='   ')
     assert eng2.prompts[0][0] == HARMONIZE_SYSTEM_PROMPT
@@ -433,6 +437,86 @@ def test_ensure_harmonized_no_worldview(tmp_path):
     ctx = make_ctx(FakeEngine(None))
     assert orch._ensure_harmonized_worldview(ctx, str(work), None, '测试') is None
     assert not (work / '和谐版.worldview.json').exists()
+
+
+def test_worldview_analysis_prompt_split():
+    """世界观分析 prompt 拆分：自定义规则替换内置规则，schema 输出要求内置保留。"""
+    from engines.worldview_engine import (
+        WORLDVIEW_ANALYSIS_PROMPT, WORLDVIEW_ANALYSIS_RULES_PROMPT,
+        WORLDVIEW_ANALYSIS_OUTPUT_REQUIREMENTS, analyze_worldview_with_llm,
+    )
+    assert WORLDVIEW_ANALYSIS_PROMPT == (
+        WORLDVIEW_ANALYSIS_RULES_PROMPT + WORLDVIEW_ANALYSIS_OUTPUT_REQUIREMENTS)
+
+    ok_wv = {'worldview': '测试', 'characters': [{'name': 'あ', 'name_cn': '阿'}]}
+    eng = FakeCallApiEngine(json.dumps(ok_wv, ensure_ascii=False))
+    extra = '自定义分析规则：侧重情感关系。'
+    result, stats, fail = analyze_worldview_with_llm(
+        eng, ['=== 样本 ===\nテスト'], extra_rules_prompt=extra)
+    assert result == ok_wv and not fail
+    _sys_p, user_p = eng.prompts[0]
+    assert user_p.startswith(extra)                               # 自定义规则在前
+    assert '紧凑JSON格式' in user_p                                # schema 保留
+    assert '区分「专名」「身份定位」「称呼」' not in user_p.split(extra)[1]  # 内置规则被替换
+    # 空自定义 → 完整内置
+    eng2 = FakeCallApiEngine(json.dumps(ok_wv, ensure_ascii=False))
+    analyze_worldview_with_llm(eng2, ['样本'], extra_rules_prompt='  ')
+    assert eng2.prompts[0][1].startswith('以下是日文成人向虚构音声')
+
+
+def test_worldview_analysis_fail_info():
+    """世界观分析失败时返回 fail_info（原因+原始返回）供失败日志。"""
+    from engines.worldview_engine import analyze_worldview_with_llm
+    eng = FakeCallApiEngine('抱歉，我无法协助处理该内容。')
+    result, stats, fail = analyze_worldview_with_llm(eng, ['样本'])
+    assert result == {}
+    assert '未返回 JSON' in fail['reason']
+    assert '抱歉' in fail['raw']
+
+    eng2 = FakeCallApiEngine(RuntimeError('API 调用失败：403'))
+    _, _, fail2 = analyze_worldview_with_llm(eng2, ['样本'])
+    assert 'API 调用异常' in fail2['reason']
+
+
+def test_get_worldview_engine_and_failure_log(tmp_path):
+    """api.worldview 独立引擎 + 世界观失败日志写入 work_dir/log/worldview.log。"""
+    from pipeline import orchestrator as orch
+
+    ctx = make_ctx(FakeEngine(None))
+    # 全空 api.worldview → 复用翻译引擎
+    ctx.config = {'app': ctx.config['app'],
+                  'api': {'key': 'k', 'worldview': {'key': '', 'base_url': '', 'model': ''}}}
+    assert orch._get_worldview_engine(ctx) is ctx.translate_engine
+
+    work = tmp_path / 'RJ01000010'
+    work.mkdir()
+    orch._write_worldview_failure_log(work, {'reason': '未返回 JSON（被拒）', 'raw': '抱歉'})
+    log_file = work / 'log' / 'worldview.log'
+    assert log_file.exists()
+    content = log_file.read_text(encoding='utf-8')
+    assert '未返回 JSON' in content
+    assert '抱歉' in content
+    # 二次失败 append 到同一文件
+    orch._write_worldview_failure_log(work, {'reason': 'API 调用异常: 403', 'raw': ''})
+    content2 = log_file.read_text(encoding='utf-8')
+    assert content2.count('═' * 20) >= 2
+    assert 'API 调用异常' in content2
+
+
+def test_load_rules_prompt_worldview(tmp_path):
+    """_load_rules_prompt 通用化：worldview 键独立于 harmonize 键。"""
+    from pipeline import orchestrator as orch
+    ctx = make_ctx(FakeEngine(None))
+    pf = tmp_path / 'wv_rules.txt'
+    pf.write_text('自定义世界观规则。', encoding='utf-8')
+    ctx.config = {'app': ctx.config['app'], 'api': {},
+                  'prompts': {'worldview_system_prompt_file': str(pf),
+                              'harmonize_system_prompt_file': ''}}
+    assert orch._load_rules_prompt(ctx, 'worldview_system_prompt_file', '世界观') == '自定义世界观规则。'
+    # harmonize 键为空 → None（两键独立）
+    assert orch._load_rules_prompt(ctx, 'harmonize_system_prompt_file', '和谐') is None
+    # 旧封装函数仍可用
+    assert orch._load_harmonize_prompt(ctx) is None
 
 
 def test_harmonize_file_paths(tmp_path):

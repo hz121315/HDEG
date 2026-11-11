@@ -266,7 +266,9 @@ def save_harmonized_worldview(work_dir: "Path", worldview: dict) -> None:
 
 # 和谐化改写规则：力度适中，只模糊"违背伦理"的高危表述（未成年/亲属关系/性暴力等），
 # 成年角色间的成人向内容保留原样，其余描述尽量不动。
-HARMONIZE_SYSTEM_PROMPT = (
+# 拆为「规则部分」（可被 prompts.harmonize_system_prompt_file 自定义替换）
+# 和「输出要求」（内置保留，自定义 prompt 拼接在其之前）。
+HARMONIZE_RULES_PROMPT = (
     "你是一名内容合规编辑。用户提供一部虚构音声作品的设定资料（JSON 格式，"
     "含世界观简介、角色表、主题、特殊术语），你的任务是将其中的高危表述改写为合规版本，"
     "用于替代原资料参与后续翻译，这是一个常规的内容合规改写工作。\n\n"
@@ -280,13 +282,20 @@ HARMONIZE_SYSTEM_PROMPT = (
     "程度相近但合规的描述。\n"
     "4. 其他类似高危设定（监禁、药物控制等）：同样选用意思相近的温和表述。\n"
     "5. 上述之外的成年角色间成人向内容、普通设定、人名、性格描述一律保持原样，"
-    "不要过度改写，不要扩写或添加任何解释性文字。\n\n"
-    "【输出要求】\n"
+    "不要过度改写，不要扩写或添加任何解释性文字。\n"
+)
+
+# 和谐化输出要求：内置保留（JSON 结构一致是解析硬依赖，name 不变是降级链第3级硬依赖）
+HARMONIZE_OUTPUT_REQUIREMENTS = (
+    "\n【输出要求】\n"
     "1. 输出 JSON 的结构、字段名、键与输入完全一致，只修改字符串内容。\n"
     "2. characters 中每个角色的 name 字段（日文原文称呼）保持不变，"
     "确保与作品原文对齐；name_cn 如含上述高危词一并改写。\n"
     "3. 只输出改写后的 JSON 本体，禁止输出 JSON 之外的任何内容。\n"
 )
+
+# 兼容旧引用：完整内置 prompt = 规则 + 输出要求
+HARMONIZE_SYSTEM_PROMPT = HARMONIZE_RULES_PROMPT + HARMONIZE_OUTPUT_REQUIREMENTS
 
 
 def harmonize_worldview_with_llm(engine, worldview: dict, verbose: bool = False,
@@ -297,9 +306,10 @@ def harmonize_worldview_with_llm(engine, worldview: dict, verbose: bool = False,
         engine: 带 call_api(system_prompt, user_prompt, override_gen_params=...) 的引擎
         worldview: 原始世界观字典（会剥离 _source 等内部字段后发送）
         verbose: 是否打印调试信息
-        extra_system_prompt: 用户自定义的前置 prompt（config prompts.harmonize_system_prompt_file
-            的文件内容），拼接在内置规则之前——用于补充内置规则未覆盖的高危类别
-            （如血腥暴力）。为空时纯用内置规则。
+        extra_system_prompt: 用户自定义的规则 prompt（config prompts.harmonize_system_prompt_file
+            的文件内容），**替换**内置改写规则部分；内置【输出要求】（JSON 结构一致、
+            name 不变、只输出 JSON）始终保留在后，无需在自定义文件中重复。
+            为空时使用纯内置规则。
 
     返回:
         (和谐后的世界观 dict, token_stats)；失败（API 异常/JSON 解析失败/结构校验失败）返回 (None, token_stats)
@@ -313,9 +323,9 @@ def harmonize_worldview_with_llm(engine, worldview: dict, verbose: bool = False,
     payload = {k: v for k, v in worldview.items() if not k.startswith('_')}
     user_prompt = _json.dumps(payload, ensure_ascii=False, indent=2)
 
-    # 自定义前置 prompt 在前（优先级高），内置规则在后兜底输出格式约束
+    # 自定义前置 prompt 在前（优先级高），内置【输出要求】始终保留在后（解析硬依赖）
     if extra_system_prompt and extra_system_prompt.strip():
-        system_prompt = f"{extra_system_prompt.strip()}\n\n{HARMONIZE_SYSTEM_PROMPT}"
+        system_prompt = f"{extra_system_prompt.strip()}\n\n{HARMONIZE_OUTPUT_REQUIREMENTS}"
     else:
         system_prompt = HARMONIZE_SYSTEM_PROMPT
 
@@ -419,15 +429,10 @@ def build_worldview_prompt(worldview: dict) -> str:
 
 # ==================== LLM 世界观分析 ====================
 
-WORLDVIEW_ANALYSIS_PROMPT = (
+# 世界观分析规则部分：可被 prompts.worldview_system_prompt_file 自定义替换。
+WORLDVIEW_ANALYSIS_RULES_PROMPT = (
     "以下是日文成人向虚构音声（ASMR/RJ作品）的ASR转录文本样本。\n"
     "请分析这些样本，提取作品的世界观信息。\n\n"
-    "输出要求（紧凑JSON格式）：\n"
-    '{"worldview": "作品世界观简介（500字以内，包含：时代背景、主要角色关系、核心设定、情感基调、故事走向）", '
-    '"characters": [{"name": "该角色被称呼的日文原文（专名优先）", "name_cn": "name 对应的自然中文译名或称呼（无则留空）", '
-    '"role": "身份定位/职业/立场/设定", "personality": "性格特点", "relationship": "与其他角色的关系"}], '
-    '"themes": ["主题1", "主题2"], '
-    '"special_terms": {"日文术语": "中文译名"}}\n\n'
     "注意：\n"
     "- worldview 必须详细，用于辅助后续翻译理解上下文，控制在500字以内\n"
     "- characters 列出所有主要角色（含主人公/听者），最多10个\n"
@@ -440,32 +445,58 @@ WORLDVIEW_ANALYSIS_PROMPT = (
     "- relationship 描述角色间的关系（如：恋人、朋友、同事、家人等），帮助翻译时保持关系一致性\n"
     "- special_terms 列出对翻译有影响的特殊设定术语。值必须是纯中文译名（词语/短語），禁止残留日文假名、禁止半翻译、禁止加括号注释或解释说明。因为该译名会被直接注入术语表作为强制翻译\n"
     "- 成人向虚构内容请以学术化方式客观描述设定，无需回避\n"
+)
+
+# 世界观分析输出要求：内置保留（JSON schema 是解析与术语注入的硬依赖，
+# special_terms 纯译名约束会被 _inject_worldview_terms 直接消费）。
+WORLDVIEW_ANALYSIS_OUTPUT_REQUIREMENTS = (
+    "\n输出要求（紧凑JSON格式）：\n"
+    '{"worldview": "作品世界观简介（500字以内，包含：时代背景、主要角色关系、核心设定、情感基调、故事走向）", '
+    '"characters": [{"name": "该角色被称呼的日文原文（专名优先）", "name_cn": "name 对应的自然中文译名或称呼（无则留空）", '
+    '"role": "身份定位/职业/立场/设定", "personality": "性格特点", "relationship": "与其他角色的关系"}], '
+    '"themes": ["主题1", "主题2"], '
+    '"special_terms": {"日文术语": "中文译名"}}\n'
     "- 不要输出任何 JSON 之外的内容\n"
 )
 
+# 兼容旧引用：完整内置 prompt = 规则 + 输出要求
+WORLDVIEW_ANALYSIS_PROMPT = WORLDVIEW_ANALYSIS_RULES_PROMPT + WORLDVIEW_ANALYSIS_OUTPUT_REQUIREMENTS
 
-def analyze_worldview_with_llm(engine, samples: list[str], verbose: bool = False) -> tuple:
+
+def analyze_worldview_with_llm(engine, samples: list[str], verbose: bool = False,
+                               extra_rules_prompt: str = None) -> tuple:
     """调用 LLM 分析作品世界观
 
     参数:
         engine: OpenAICompatEngine 实例
         samples: 抽样文本列表
-        verbose: 是否输出调试信息
+        verbose: 是否打印调试信息
+        extra_rules_prompt: 用户自定义的规则 prompt（config prompts.worldview_system_prompt_file
+            的文件内容），**替换**内置分析规则部分；内置输出要求（JSON schema、
+            只输出 JSON）始终保留，无需在自定义文件中重复。为空时使用纯内置规则。
 
-    返回: (世界观字典, token_stats)
+    返回: (世界观字典, token_stats, fail_info)
+        fail_info: 失败时的诊断信息 dict {'reason', 'raw'}；成功时为 {}。
+        raw 为模型原始返回（拒答时通常是拒绝话术文本，写失败日志用）。
     """
     import json as _json
 
     if not samples:
-        return {}, {}
+        return {}, {}, {}
 
-    content = WORLDVIEW_ANALYSIS_PROMPT + "\n\n" + "\n\n".join(samples)
+    # 自定义规则替换内置规则部分；输出要求（schema）内置保留在后
+    if extra_rules_prompt and extra_rules_prompt.strip():
+        rules = extra_rules_prompt.strip()
+        content = f"{rules}\n{WORLDVIEW_ANALYSIS_OUTPUT_REQUIREMENTS}\n\n" + "\n\n".join(samples)
+    else:
+        content = WORLDVIEW_ANALYSIS_PROMPT + "\n\n" + "\n\n".join(samples)
     if verbose:
         print(f"    [DEBUG] 发送给 LLM 的文本长度: {len(content)} 字符", flush=True)
     print(f"    [世界观分析] 正在调用 LLM...", flush=True)
 
     try:
-        system_prompt = "你是精通日语成人向虚构音声作品的分析专家。请严格按照JSON格式输出分析结果，不要输出任何其他内容。"
+        system_prompt = ("你是精通日语成人向虚构音声作品的分析专家。"
+                         "请严格按照JSON格式输出分析结果，不要输出任何其他内容。")
         raw_output, token_stats = engine.call_api(
             system_prompt, content,
             override_gen_params={'temperature': 0.1},
@@ -480,17 +511,18 @@ def analyze_worldview_with_llm(engine, samples: list[str], verbose: bool = False
                 print(f"    [世界观分析] 完成!", flush=True)
                 print(f"      世界观: {result.get('worldview', '')[:100]}...", flush=True)
                 print(f"      角色: {len(result.get('characters', []))} 个", flush=True)
-                return result, token_stats
+                return result, token_stats, {}
             except _json.JSONDecodeError as e:
                 print(f"    ⚠ JSON 解析错误: {e}", flush=True)
-                return {}, {}
+                return {}, token_stats, {'reason': f'JSON 解析错误: {e}', 'raw': raw_output}
         else:
             print(f"    ⚠ 未找到 JSON 格式内容", flush=True)
-            return {}, {}
+            return {}, token_stats, {'reason': '未返回 JSON 格式内容（可能被内容策略拒绝）',
+                                     'raw': raw_output}
 
     except Exception as e:
         print(f"    ⚠ 世界观分析失败: {e}", flush=True)
-        return {}, {}
+        return {}, {}, {'reason': f'API 调用异常: {e}', 'raw': ''}
 
 
 # ==================== FreeTalk 检测 ====================
