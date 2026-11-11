@@ -9,13 +9,15 @@
       "key": "",
       "base_url": "",
       "model": "",
-      "protocol": ""
+      "protocol": "",
+      "generation_params": {}
     },
     "worldview": {
       "key": "",
       "base_url": "",
       "model": "",
-      "protocol": ""
+      "protocol": "",
+      "generation_params": {}
     },
     "models": {
       "muse-spark": {"protocol": "responses", "note": "Zen网关仅支持responses",

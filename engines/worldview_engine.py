@@ -298,6 +298,18 @@ HARMONIZE_OUTPUT_REQUIREMENTS = (
 HARMONIZE_SYSTEM_PROMPT = HARMONIZE_RULES_PROMPT + HARMONIZE_OUTPUT_REQUIREMENTS
 
 
+def _temperature_override(engine) -> dict:
+    """世界观分析/和谐化的默认 temperature=0.1。
+
+    仅当对应用途的 api.worldview/api.harmonize.generation_params 显式配置了
+    temperature（由 _get_context_engine 在引擎上打 _purpose_temp_locked 标记）时
+    才不覆盖；全局 temperature 不影响这两个用途，保持旧的 0.1 默认。
+    """
+    if getattr(engine, '_purpose_temp_locked', False):
+        return {}
+    return {'temperature': 0.1}
+
+
 def harmonize_worldview_with_llm(engine, worldview: dict, verbose: bool = False,
                                  extra_system_prompt: str = None) -> tuple:
     """调用 LLM 对世界观进行"和谐化"改写（NSFW 降级重试用）。
@@ -333,7 +345,7 @@ def harmonize_worldview_with_llm(engine, worldview: dict, verbose: bool = False,
     try:
         raw_output, token_stats = engine.call_api(
             system_prompt, user_prompt,
-            override_gen_params={'temperature': 0.1},
+            override_gen_params=_temperature_override(engine),
         )
     except Exception as e:
         print(f"    ⚠ 世界观和谐化请求失败: {e}", flush=True)
@@ -499,7 +511,7 @@ def analyze_worldview_with_llm(engine, samples: list[str], verbose: bool = False
                          "请严格按照JSON格式输出分析结果，不要输出任何其他内容。")
         raw_output, token_stats = engine.call_api(
             system_prompt, content,
-            override_gen_params={'temperature': 0.1},
+            override_gen_params=_temperature_override(engine),
         )
         if verbose:
             print(f"    [DEBUG] LLM 原始输出 (前300字): {raw_output[:300]}", flush=True)

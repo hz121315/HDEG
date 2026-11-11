@@ -112,6 +112,7 @@ def make_ctx(engine, *, nsfw_fallback_enabled=True, config_app=None):
         },
         pr=SimpleNamespace(debug_enabled=False, token_inline=lambda u: None),
         tracker=FakeTracker(),
+        pricing={'hit_per_1m': 0.02, 'miss_per_1m': 1, 'completion_per_1m': 2},
         translate_engine=engine,
         max_failed_retries=3,
         nsfw_fallback_enabled=nsfw_fallback_enabled,
@@ -310,14 +311,17 @@ def test_api_exception_triggers_fallback(tmp_path):
 # ==================== 和谐化 LLM 单元 ====================
 
 class FakeCallApiEngine:
-    def __init__(self, reply, stats=None):
+    def __init__(self, reply, stats=None, config=None):
         self.reply = reply
         self.stats = stats or {'prompt_tokens': 5, 'hit_tokens': 1, 'miss_tokens': 4,
                                'completion_tokens': 2, 'reasoning_tokens': 0}
+        self.config = config or {}
         self.prompts: list[tuple[str, str]] = []
+        self.calls: list[dict] = []   # 记录 override_gen_params 等调用参数
 
     def call_api(self, system_prompt, user_prompt, **kwargs):
         self.prompts.append((system_prompt, user_prompt))
+        self.calls.append(kwargs)
         if isinstance(self.reply, Exception):
             raise self.reply
         return self.reply, self.stats
@@ -501,6 +505,65 @@ def test_get_worldview_engine_and_failure_log(tmp_path):
     content2 = log_file.read_text(encoding='utf-8')
     assert content2.count('═' * 20) >= 2
     assert 'API 调用异常' in content2
+
+
+def test_context_engine_merges_generation_params():
+    """api.worldview/harmonize 的 generation_params 覆盖全局，未列项继承；仅配参数也建独立引擎。"""
+    from pipeline import orchestrator as orch
+
+    ctx = make_ctx(FakeEngine(None))
+    ctx.config = {'app': {}, 'api': {
+        'key': 'k', 'model': 'm', 'base_url': 'http://x',
+        'generation_params': {'reasoning_effort': 'low', 'top_p': 0.9},
+        'worldview': {'generation_params': {'temperature': 0.3, 'reasoning_effort': 'high'}},
+    }}
+    eng = orch._get_worldview_engine(ctx)
+    assert eng is not ctx.translate_engine          # 仅参数覆盖也建独立引擎
+    gp = eng.config['generation_params']
+    assert gp['temperature'] == 0.3                 # 子段覆盖
+    assert gp['reasoning_effort'] == 'high'
+    assert gp['top_p'] == 0.9                       # 未列项继承全局
+    assert eng.config['model'] == 'm'               # 端点继承全局
+    assert eng._purpose_temp_locked is True         # 子段显式 temperature
+
+    # harmonize 子段与 worldview 相互独立
+    ctx.config['api']['harmonize'] = {'generation_params': {'reasoning_effort': 'max'}}
+    eng2 = orch._get_harmonize_engine(ctx)
+    assert eng2.config['generation_params']['reasoning_effort'] == 'max'
+    assert 'temperature' not in eng2.config['generation_params']
+    assert eng2._purpose_temp_locked is False       # 未配置 temperature → 仍用 0.1
+
+
+def test_harmonize_temperature_respects_configured():
+    """子段显式配置 temperature 时才不强制 0.1；全局 temperature 不放开默认。"""
+    from engines.worldview_engine import harmonize_worldview_with_llm
+    reply = json.dumps(HARMONIZED_WV, ensure_ascii=False)
+
+    eng = FakeCallApiEngine(reply)
+    eng._purpose_temp_locked = True                 # 子段显式配置（引擎标记）
+    harmonize_worldview_with_llm(eng, dict(ORIG_WV))
+    assert eng.calls[0]['override_gen_params'] == {}
+
+    # 全局配置 temperature（无子段）→ 仍强制默认 0.1
+    eng2 = FakeCallApiEngine(reply, config={'generation_params': {'temperature': 0.3}})
+    harmonize_worldview_with_llm(eng2, dict(ORIG_WV))
+    assert eng2.calls[0]['override_gen_params'] == {'temperature': 0.1}
+
+
+def test_worldview_temperature_respects_configured():
+    """世界观分析同样：仅子段显式 temperature 才不覆盖。"""
+    from engines.worldview_engine import analyze_worldview_with_llm
+    ok = {'worldview': 'x', 'characters': [{'name': 'a', 'name_cn': '阿'}]}
+    reply = json.dumps(ok, ensure_ascii=False)
+
+    eng = FakeCallApiEngine(reply)
+    eng._purpose_temp_locked = True
+    analyze_worldview_with_llm(eng, ['样本'])
+    assert eng.calls[0]['override_gen_params'] == {}
+
+    eng2 = FakeCallApiEngine(reply)
+    analyze_worldview_with_llm(eng2, ['样本'])
+    assert eng2.calls[0]['override_gen_params'] == {'temperature': 0.1}
 
 
 def test_load_rules_prompt_worldview(tmp_path):

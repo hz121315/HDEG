@@ -2186,9 +2186,12 @@ def _enqueue_failed_track(ctx: PipelineContext, task: dict, reason: str) -> None
 def _get_context_engine(ctx: PipelineContext, sub_key: str, cache_attr: str, tag: str):
     """获取指定用途的 LLM 引擎（懒加载，线程安全，harmonize/worldview 通用）。
 
-    config api.<sub_key>（如 api.harmonize / api.worldview）的 key/base_url/model
-    全为空时直接复用翻译引擎；任一非空时深拷贝配置、用非空字段覆盖 api 段对应键后
-    创建独立引擎（models 注册表、generation_params、超时等其余配置全部继承全局）。
+    config api.<sub_key>（如 api.harmonize / api.worldview）支持覆盖：
+      - key / base_url / model / protocol：独立端点与模型
+      - generation_params：按用途覆盖全局生成参数（reasoning_effort、temperature、
+        top_p、max_tokens、max_retries 等），未列出的项继承全局
+    四项端点字段与 generation_params 全为空时直接复用翻译引擎；任一非空时深拷贝
+    配置并合并覆盖后创建独立引擎（models 注册表、超时等其余配置继承全局）。
     """
     with ctx.thread_lock:
         _cached = getattr(ctx, cache_attr, None)
@@ -2197,8 +2200,10 @@ def _get_context_engine(ctx: PipelineContext, sub_key: str, cache_attr: str, tag
         h_cfg = (ctx.config.get('api', {}) or {}).get(sub_key) or {}
         if not isinstance(h_cfg, dict):
             h_cfg = {}
-        _has_override = any(str(h_cfg.get(k) or '').strip()
-                            for k in ('key', 'base_url', 'model'))
+        _sub_gen = h_cfg.get('generation_params')
+        _has_gen_override = isinstance(_sub_gen, dict) and bool(_sub_gen)
+        _has_override = _has_gen_override or any(
+            str(h_cfg.get(k) or '').strip() for k in ('key', 'base_url', 'model'))
         if not _has_override:
             _engine = ctx.translate_engine
             setattr(ctx, cache_attr, _engine)
@@ -2210,13 +2215,25 @@ def _get_context_engine(ctx: PipelineContext, sub_key: str, cache_attr: str, tag
             _v = str(h_cfg.get(_k) or '').strip()
             if _v:
                 api[_k] = _v
+        if _has_gen_override:
+            # 子段生成参数覆盖全局同名项，其余保持继承
+            _gp = api.get('generation_params')
+            if not isinstance(_gp, dict):
+                _gp = {}
+                api['generation_params'] = _gp
+            _gp.update(_sub_gen)
         from engines.translate_engine import create_translate_engine
         _engine = create_translate_engine(
             api,
             verbose=ctx.pr.debug_enabled,
             pricing=ctx.pricing,
         )
-        _log(f"  [{tag}] 使用独立 API: model={api.get('model')}")
+        # 标记：该用途是否显式配置了 temperature（供 worldview_engine 决定
+        # 是否仍强制其默认的 0.1；全局 temperature 不触发该标记）
+        setattr(_engine, '_purpose_temp_locked',
+                isinstance(_sub_gen, dict) and 'temperature' in _sub_gen)
+        _log(f"  [{tag}] 使用独立引擎: model={api.get('model')}"
+             + (f", 覆盖参数={sorted(_sub_gen)}" if _has_gen_override else ""))
         setattr(ctx, cache_attr, _engine)
         return _engine
 

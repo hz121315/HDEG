@@ -20,7 +20,9 @@
 | app.translate_failed_max_retries | 3 | 音轨级重试轮数；上下文最小钳制为 1 |
 | app.nsfw_fallback_enabled | true | NSFW 多级降级重试总开关（2026-11-10 新增，见下） |
 | api.harmonize.{key,base_url,model,protocol} | 空 | 世界观和谐化专用 API；全空时复用翻译 API（2026-11-10 新增） |
+| api.harmonize.generation_params | {} | 按用途覆盖全局生成参数（reasoning_effort/temperature/top_p/max_tokens/max_retries 等），未列项继承全局；仅配参数也会建独立引擎（2026-11-11 新增） |
 | api.worldview.{key,base_url,model,protocol} | 空 | 世界观**分析**专用 API；全空时复用翻译 API；与 api.harmonize 相互独立（2026-11-11 新增） |
+| api.worldview.generation_params | {} | 同 api.harmonize.generation_params（2026-11-11 新增） |
 | prompts.harmonize_system_prompt_file | 空（发布件指向 prompts/harmonize.txt） | 和谐化自定义规则 prompt（UTF-8）；**替换**内置改写规则部分，内置【输出要求】始终附加；缺失/为空/读取失败回退纯内置（2026-11-10 新增，2026-11-11 语义从"拼接"改为"替换"） |
 | prompts.worldview_system_prompt_file | 空（发布件指向 prompts/worldview.txt） | 世界观分析自定义规则 prompt；同上替换语义（2026-11-11 新增） |
 | prompts.system_prompt_file | prompts/translation.txt（发布件/模板/本地） | 翻译“可自定义基础设定”；台本优先级与字幕标点规范为 `translate_engine.py` 内置常量，**始终追加、不可被文件替换**。文本已抽离为 prompts/translation.txt（源仓库/发布目录/打包内嵌三处同源）。为空或文件缺失时回退 exe 内嵌副本；相对路径先按 CWD、再按程序目录解析。术语/alias/世界观仍由 build_system_prompt 追加（2026-11-11 抽取；同日台本/标点写死内置） |

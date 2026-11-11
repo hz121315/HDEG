@@ -613,14 +613,16 @@ def copy_config():
             api["harmonize"] = {}
         for _hk in ("key", "base_url", "model", "protocol"):
             api["harmonize"].setdefault(_hk, "")
-        print("  补齐 api.harmonize 占位（空 = 复用翻译 API）")
+        api["harmonize"].setdefault("generation_params", {})
+        print("  补齐 api.harmonize 占位（空 = 复用翻译 API；generation_params 可覆盖全局参数）")
 
     # 世界观分析专用 API 子段（空值 = 复用翻译 API；显式占位供用户填写）
     if not isinstance(api.get("worldview"), dict):
         api["worldview"] = {}
     for _wk in ("key", "base_url", "model", "protocol"):
         api["worldview"].setdefault(_wk, "")
-    print("  补齐 api.worldview 占位（空 = 复用翻译 API）")
+    api["worldview"].setdefault("generation_params", {})
+    print("  补齐 api.worldview 占位（空 = 复用翻译 API；generation_params 可覆盖全局参数）")
 
     # prompt 引用键占位；随后若生成 prompts/ 目录则指向其中文件
     if not isinstance(config.get("prompts"), dict):

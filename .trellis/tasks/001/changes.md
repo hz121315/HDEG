@@ -94,6 +94,17 @@
 - 测试：`tests/test_translation_prompt.py` 更新 4 项 + 新增 1 项（内置机械规则内容、外部替换仍保留内置规则），全量 77 passed。
 - 文档：`使用说明.md` 的 prompts 小节更新组装公式与写作要点。
 
+## 2026-11-11 世界观/和谐化支持独立 generation_params
+
+- `_get_context_engine`：`api.worldview` / `api.harmonize` 新增 `generation_params` 子段，
+  深拷贝后合并覆盖全局同名参数；endpoint 字段与 generation_params 全空才复用翻译引擎
+  （仅配参数也会创建独立引擎）。日志改为“使用独立引擎”并列出覆盖参数键。
+- `worldview_engine._temperature_override`：世界观分析/和谐化默认 temperature=0.1 改为
+  “未显式配置时才生效”——子段 generation_params 含 temperature 时不再覆盖。
+- `config.example.json` / 本地 config / `build_release.py` 占位补 `generation_params: {}`。
+- 文档：`使用说明.md` api 段新增独立参数示例与语义。
+- 测试：新增 3 项（子段合并/独立引擎、harmonize temperature 尊重配置、worldview 同上），全量 81 passed。
+
 ## 环境与打包经历（非业务代码变更）
 
 - 最初 GitHub 直连失败，先下载快照，后重试取得 Git 仓库；后续 origin 指向用户仓库 hz121315/HDEG。
