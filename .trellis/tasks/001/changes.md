@@ -132,14 +132,13 @@
   内部重试、并发隔离及白名单防泄露。含上一轮解析计数修复，离线全量 124 passed、1 deselected，
   一条既有 pkg_resources 弃用警告；未真实调用 API、未打包、未提交推送。
 
-## 根目录 release 发布交付
+## 根目录 release 发布交付（已回滚）
 
-- 按用户要求将最新构建复制至根目录 `release/`（本地构建输出仍为 `temp/`），包含
-  脱敏 config、5 个 BAT、3 份 prompts、提示词与使用说明。
-- main.exe（约 117 MB）**未入库**：超过 GitHub 普通 Git 的 100 MiB 单文件上限；
-  改用 Git LFS 后被 GitHub 拒绝（公开 fork 不允许上传新 LFS 对象，
-  `can not upload new objects to public fork`）。exe 保留在本地 `release/`，
-  由用户通过 GitHub Release 附件或本地打包分发；`.gitignore` 已排除 `release/main.exe`。
+- 曾按用户要求把最新构建复制到根目录 `release/` 并尝试入库；main.exe（约 117 MB）
+  超过 GitHub 普通 Git 的 100 MiB 单文件上限，改用 Git LFS 后被 GitHub 拒绝
+  （公开 fork 不允许上传新 LFS 对象）。用户决定放弃该交付方式。
+- 已从远端移除 `release/` 目录，`.gitignore` 忽略本地 `release/`；本地构建仍输出到 `temp/`，
+  使用说明改为“仓库不保存打包产物，执行 build_release.py 本地生成”。
 - 发布配置清理补齐独立 worldview/harmonize 及其他 API 层级的凭证，不再输出 key 前缀。
 - 日志边界修正：OpenAI 按 SDK 调用记录（可能包含 SDK 内部重试），其他两协议按 HTTP 请求记录；
   新增 scope 字段与真实 SDK 的 MockTransport 回归，不改变重试策略。

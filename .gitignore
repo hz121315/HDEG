@@ -188,13 +188,5 @@ __pycache__/
 
 # 打包产物
 temp/
-
-# 用户指定的公开发布目录（main.exe 走 GitHub Release，不入 Git 历史）
-release/main.exe
-!/release/
-!/release/*.bat
-!/release/config.json
-!/release/*.md
-!/release/*.txt
-!/release/prompts/
-!/release/prompts/*.txt
+# 本地发布副本（不随仓库分发；main.exe 约 117MB，超过 GitHub 单文件上限）
+release/
