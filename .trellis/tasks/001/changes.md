@@ -163,6 +163,18 @@
   该行为只出现在 `smart=false` 路径）。
 - 未调用 infer 实际转录、未打包、未提交推送。
 
+## 2026-11-16 默认转录参数改为 smart VAD 组合
+
+- `build_release.py`、`config.example.json`、本地 `config.json` 的 `extra_args` 默认值改为：
+  `--smart_split_with_vad=true`、`--vad_filter=true`、`--vad_threshold=0.3`、
+  `--vad_min_speech_duration_ms=150`、`--no_speech_threshold=0.85`、`--beam_size=5`。
+- 旧默认：`--enable_batching --batch_size=32 --smart_split_with_vad=false`；
+  引擎侧旧值：vad_threshold=0.5、min_speech=300ms、no_speech_threshold=0.6、beam_size=1。
+- `enable_batching/batch_size` 不再默认（`smart=true` 走逐块解码，本身不使用 batching）。
+- 文档：`使用说明.md` 新增参数作用与新旧默认值对照表；`README.md` 同步默认值摘要。
+- `build_release.py` 增加 Windows 兜底：发布目录被资源管理器/终端占用、`rmtree` 失败时，
+  清空内容后复用目录，不再因 `WinError 32` 中断打包。
+
 ## 环境与打包经历（非业务代码变更）
 
 - 最初 GitHub 直连失败，先下载快照，后重试取得 Git 仓库；后续 origin 指向用户仓库 hz121315/HDEG。

@@ -62,13 +62,13 @@ RJ 正则仍为 `RJ\d{6,}`、忽略大小写、匹配目录名中的子串；本
 | transcription.compute_type | float16（2026-11-10 起发布件/模板/本地默认） | 按 9700X+32G+5070 Ti 配置；旧默认 int8_float16；auto_tune 开启时 ≥10GB 仍会改 float16（与显式一致） |
 | transcription.audio_suffixes | mp3,wav,flac,m4a,aac,ogg,wma,mp4,mkv,avi,mov,webm,flv,wmv | 同时驱动 HDEG 音频发现和 infer 参数；不是 app.audio_suffixes |
 | transcription.sub_formats | lrc | 管道依赖 LRC；只改为其他格式会使 watcher 找不到产物 |
-| transcription.extra_args | `["--enable_batching", "--batch_size=32", "--smart_split_with_vad=false"]`（2026-11-10 起发布件/模板/本地默认） | 非空时为最终生效值，auto_tune 自动参数让位。2026-11-16 起：`--vad_filter`/`--no_speech_threshold`/`--beam_size` 自动合并进引擎 `generation_config.json5`（临时文件 + `--generation_config`），其余参数按 CLI 透传；`build_release.py` 仅在 extra_args 缺省时写入默认值，显式配置保留 |
+| transcription.extra_args | `["--smart_split_with_vad=true", "--vad_filter=true", "--vad_threshold=0.3", "--vad_min_speech_duration_ms=150", "--no_speech_threshold=0.85", "--beam_size=5"]`（2026-11-16 起发布件/模板/本地默认） | 非空时为最终生效值，auto_tune 自动参数让位。`--vad_filter`/`--no_speech_threshold`/`--beam_size` 自动合并进引擎 `generation_config.json5`（临时文件 + `--generation_config`），其余按 CLI 透传；`build_release.py` 仅在 extra_args 缺省时写入默认值，显式配置保留。旧默认：`["--enable_batching", "--batch_size=32", "--smart_split_with_vad=false"]`，vad_threshold=0.5、vad_min_speech_duration_ms=300、no_speech_threshold=0.6、beam_size=1 |
 | transcription.main_exe | 空 | 发布 BAT 可指定启动主程序，空为同目录 main.exe |
 | transcription.auto_tune | true（代码隐式，示例未列） | 按第一张 GPU 总显存选择精度和批大小，来自夹带的既有改动，不是最初确认范围 |
 
 当前自动批大小：≥14GB 为 32，≥10GB 为 24，≥7GB 为 16，否则 8；自动列表开启 batching、设 batch_size 并关闭 smart_split_with_vad。**非空 extra_args 不阻止 compute_type 提前被自动修改**（新默认显式 float16 与之一致，无实际冲突）。
 
-2026-11-10 起 `float16 + batch 32 + smart_split_with_vad=false` 已成为发布件（`build_release.py` copy_config 强制写入）、`config.example.json` 模板与本地运行配置的默认值，依据用户确认的目标机规格（9700X + 32G 内存 + 5070 Ti 16G 显存），不再依赖运行时 auto_tune 或手动修改。低显存机器的回退方式见《使用说明.md》。仅适用于支持这些参数的 infer 版本；不是显存容量承诺。HDEG 不决定外部引擎的真实 batch 合并、吞吐或每句日志方式。
+2026-11-16 起默认改为 `float16 + smart_split_with_vad=true + vad_filter=true + vad_threshold=0.3 + vad_min_speech_duration_ms=150 + no_speech_threshold=0.85 + beam_size=5`，发布件/模板/本地配置同步；`enable_batching/batch_size` 不再默认启用（smart 分块路径本身不使用 batching）。旧默认 `float16 + batch 32 + smart_split_with_vad=false` 记录于本行历史，vad_threshold/min_speech/no_speech/beam 的旧值来自引擎配置或 whisper 默认。低显存机器回退方式见《使用说明.md》。仅适用于支持这些参数的 infer 版本；不是显存容量承诺。
 
 ## Prompt/API 保留能力
 

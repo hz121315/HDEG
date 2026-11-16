@@ -145,16 +145,30 @@ HDEG 不绑定单一厂商。模型行为由 `config.json → api.models` 注册
 
 - 五个 `Hde鸡-翻译*.bat` 行为完全一致：把拖入的目录写进 `input_path.txt`（支持多行 = 多目录，转录依次进行、翻译并行推进），然后启动 `main.exe`。**bat 不再自行调用 infer.exe 转录**，任选一个使用即可。
 - 转录参数统一在 `config.json → transcription`：`infer_exe`、`model_dir`、`device`、`compute_type`、`audio_suffixes`、`sub_formats`、`extra_args`。
-- **发布件与模板已默认高性能转录参数**（按 9700X + 32G + 5070 Ti 配置，无需手动改）：
+- **发布件与模板已默认转录参数**（按 9700X + 32G + 5070 Ti 配置）：
 
   ```json
   "transcription": {
     "compute_type": "float16",
-    "extra_args": ["--enable_batching", "--batch_size=32", "--smart_split_with_vad=false"]
+    "extra_args": [
+      "--smart_split_with_vad=true",
+      "--vad_filter=true",
+      "--vad_threshold=0.3",
+      "--vad_min_speech_duration_ms=150",
+      "--no_speech_threshold=0.85",
+      "--beam_size=5"
+    ]
   }
   ```
 
-  `--smart_split_with_vad=false` 解决"一句一句转录"（关掉按 VAD 逐块切分）；`--enable_batching --batch_size=N` 提升吞吐与显存利用率；`int8_float16` 只省显存、反而更慢且精度略低。低显存机器改回方式见《使用说明.md》。`extra_args` 非空时即为最终生效值，运行时按显存自动调参让位；打包脚本只在 `extra_args` 缺省时写入默认值，显式配置会保留。
+  `smart_split_with_vad` 启用约 15 秒的外层 VAD 智能分块；`vad_filter` 同时启用块内 VAD 过滤；
+  `vad_threshold` / `vad_min_speech_duration_ms` 控制 VAD 灵敏度与最短语音段；
+  `no_speech_threshold` 控制 whisper 跳过无语音段的概率；`beam_size=5` 提高解码精度。
+  改动前的默认值为：`--smart_split_with_vad=false`、`vad_threshold=0.5`、
+  `vad_min_speech_duration_ms=300`、`no_speech_threshold=0.6`、`beam_size=1`，
+  并额外启用 `--enable_batching --batch_size=32`。各参数作用与新旧默认值对照见《使用说明.md》。
+  `extra_args` 非空时即为最终生效值，运行时按显存自动调参让位；打包脚本只在 `extra_args`
+  缺省时写入默认值，显式配置会保留。
 
 - `extra_args` 里的 `--vad_filter`、`--no_speech_threshold`、`--beam_size` 不属于 infer 的命令行参数，
   HDEG 会自动合并进 `infer.exe` 同目录的 `generation_config.json5` 并用临时配置传给引擎；

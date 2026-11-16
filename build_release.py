@@ -268,9 +268,19 @@ def create_release_dir():
     
     if RELEASE_DIR.exists():
         print(f"  清理旧发布文件夹: {RELEASE_DIR}")
-        shutil.rmtree(RELEASE_DIR)
-    
-    RELEASE_DIR.mkdir(parents=True)
+        try:
+            shutil.rmtree(RELEASE_DIR)
+        except PermissionError:
+            # Windows 下发布目录可能被资源管理器/终端当作工作目录占用，
+            # 无法删除目录本身；此时清空内容后复用，不影响打包结果。
+            print("  ⚠ 目录被占用，改为清空内容后复用")
+            for child in RELEASE_DIR.iterdir():
+                if child.is_dir():
+                    shutil.rmtree(child, ignore_errors=True)
+                else:
+                    child.unlink(missing_ok=True)
+
+    RELEASE_DIR.mkdir(parents=True, exist_ok=True)
     print(f"OK 创建发布文件夹: {RELEASE_DIR}")
     print()
 
@@ -668,10 +678,17 @@ def copy_config():
             print(f"  保留用户 extra_args: {_user_extra}")
         else:
             config["transcription"]["extra_args"] = [
-                "--enable_batching", "--batch_size=32", "--smart_split_with_vad=false"
+                "--smart_split_with_vad=true",
+                "--vad_filter=true",
+                "--vad_threshold=0.3",
+                "--vad_min_speech_duration_ms=150",
+                "--no_speech_threshold=0.85",
+                "--beam_size=5",
             ]
             print("  设置转录默认: compute_type=float16, "
-                  "extra_args=[--enable_batching, --batch_size=32, --smart_split_with_vad=false]")
+                  "extra_args=[smart_split_with_vad=true, vad_filter=true, "
+                  "vad_threshold=0.3, vad_min_speech_duration_ms=150, "
+                  "no_speech_threshold=0.85, beam_size=5]")
     
     with open(config_dst, 'w', encoding='utf-8') as f:
         json.dump(config, f, ensure_ascii=False, indent=2)
