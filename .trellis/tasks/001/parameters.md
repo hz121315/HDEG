@@ -62,7 +62,7 @@ RJ 正则仍为 `RJ\d{6,}`、忽略大小写、匹配目录名中的子串；本
 | transcription.compute_type | float16（2026-11-10 起发布件/模板/本地默认） | 按 9700X+32G+5070 Ti 配置；旧默认 int8_float16；auto_tune 开启时 ≥10GB 仍会改 float16（与显式一致） |
 | transcription.audio_suffixes | mp3,wav,flac,m4a,aac,ogg,wma,mp4,mkv,avi,mov,webm,flv,wmv | 同时驱动 HDEG 音频发现和 infer 参数；不是 app.audio_suffixes |
 | transcription.sub_formats | lrc | 管道依赖 LRC；只改为其他格式会使 watcher 找不到产物 |
-| transcription.extra_args | `["--enable_batching", "--batch_size=32", "--smart_split_with_vad=false"]`（2026-11-10 起发布件/模板/本地默认） | 非空时为最终生效值，auto_tune 自动参数让位；build_release.py 的 copy_config 会强制写入这组默认值 |
+| transcription.extra_args | `["--enable_batching", "--batch_size=32", "--smart_split_with_vad=false"]`（2026-11-10 起发布件/模板/本地默认） | 非空时为最终生效值，auto_tune 自动参数让位。2026-11-16 起：`--vad_filter`/`--no_speech_threshold`/`--beam_size` 自动合并进引擎 `generation_config.json5`（临时文件 + `--generation_config`），其余参数按 CLI 透传；`build_release.py` 仅在 extra_args 缺省时写入默认值，显式配置保留 |
 | transcription.main_exe | 空 | 发布 BAT 可指定启动主程序，空为同目录 main.exe |
 | transcription.auto_tune | true（代码隐式，示例未列） | 按第一张 GPU 总显存选择精度和批大小，来自夹带的既有改动，不是最初确认范围 |
 

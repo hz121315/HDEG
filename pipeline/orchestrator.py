@@ -2904,6 +2904,164 @@ def translate_one_lrc(
 
 # ==================== 语音转录 ====================
 
+# infer.exe 的 argparse 未暴露、但引擎会从 generation_config.json5 读取的键。
+# 这些键写在 extra_args 里会被 argparse 拒绝，因此由 HDEG 分流到临时配置文件。
+_ENGINE_CONFIG_ARG_TYPES = {
+    '--vad_filter': bool,
+    '--no_speech_threshold': float,
+    '--beam_size': int,
+}
+
+
+def _parse_engine_config_value(key: str, raw: str):
+    """把 extra_args 里的字符串值转换成引擎配置需要的类型。"""
+    kind = _ENGINE_CONFIG_ARG_TYPES[key]
+    text = str(raw).strip()
+    if kind is bool:
+        low = text.lower()
+        if low in ('true', '1', 'yes', 'on'):
+            return True
+        if low in ('false', '0', 'no', 'off'):
+            return False
+        raise ValueError(f"{key} 需要 true/false，收到 {raw!r}")
+    if kind is int:
+        try:
+            return int(text)
+        except ValueError:
+            raise ValueError(f"{key} 需要整数，收到 {raw!r}")
+    try:
+        return float(text)
+    except ValueError:
+        raise ValueError(f"{key} 需要数值，收到 {raw!r}")
+
+
+def _split_engine_extra_args(extra_args: list[str]) -> tuple[list[str], dict, str]:
+    """拆分 extra_args：CLI 参数 / 引擎配置键 / 用户指定的 generation_config。
+
+    支持 `--key=value` 与 `--key value` 两种写法；未知参数原样保留给 CLI。
+    """
+    cli: list[str] = []
+    overrides: dict = {}
+    config_path = ''
+    i = 0
+    while i < len(extra_args):
+        arg = str(extra_args[i])
+        key, sep, inline = arg.partition('=')
+        if key == '--generation_config':
+            if sep:
+                config_path = inline
+            elif i + 1 < len(extra_args):
+                config_path = str(extra_args[i + 1])
+                i += 1
+            else:
+                raise ValueError('--generation_config 缺少路径')
+            i += 1
+            continue
+        if key in _ENGINE_CONFIG_ARG_TYPES:
+            if sep:
+                raw = inline
+            else:
+                if i + 1 >= len(extra_args) or str(extra_args[i + 1]).startswith('--'):
+                    raise ValueError(f"{key} 缺少取值")
+                i += 1
+                raw = str(extra_args[i])
+            overrides[key[2:]] = _parse_engine_config_value(key, raw)
+            i += 1
+            continue
+        cli.append(arg)
+        i += 1
+    return cli, overrides, config_path
+
+
+def _load_generation_config_file(path: Path) -> dict:
+    """读取引擎的 generation_config.json5（容忍 //、/* */ 注释与尾逗号）。
+
+    只支持 JSON5 的注释/尾逗号子集；遇到单引号、无引号键等复杂语法时明确报错，
+    避免静默丢弃引擎原有配置。
+    """
+    import json
+    text = Path(path).read_text(encoding='utf-8-sig')
+    out: list[str] = []
+    i, n = 0, len(text)
+    in_str = False
+    esc = False
+    while i < n:
+        c = text[i]
+        if in_str:
+            out.append(c)
+            if esc:
+                esc = False
+            elif c == '\\':
+                esc = True
+            elif c == '"':
+                in_str = False
+            i += 1
+            continue
+        if c == '"':
+            in_str = True
+            out.append(c)
+            i += 1
+            continue
+        if c == '/' and i + 1 < n and text[i + 1] == '/':
+            i += 2
+            while i < n and text[i] not in '\r\n':
+                i += 1
+            continue
+        if c == '/' and i + 1 < n and text[i + 1] == '*':
+            end = text.find('*/', i + 2)
+            if end == -1:
+                raise ValueError(f'{Path(path).name} 的块注释未闭合')
+            i = end + 2
+            continue
+        if c == ',':
+            j = i + 1
+            while j < n and text[j] in ' \t\r\n':
+                j += 1
+            if j < n and text[j] in '}]':
+                i += 1
+                continue
+        out.append(c)
+        i += 1
+    try:
+        data = json.loads(''.join(out))
+    except json.JSONDecodeError as e:
+        raise ValueError(f'无法解析 {Path(path).name}: {e}')
+    if not isinstance(data, dict):
+        raise ValueError(f'{Path(path).name} 顶层必须是 JSON 对象')
+    return data
+
+
+def _prepare_engine_extra_args(extra_args: list[str], engine_dir: Path
+                               ) -> tuple[list[str], Path | None]:
+    """把 extra_args 中的引擎配置键合并进临时 generation_config。
+
+    返回 (要传给 infer 的 CLI 参数, 临时配置文件路径或 None)。
+    未出现配置键时行为与旧版完全一致；解析/合并失败抛 ValueError，由调用方中止转录。
+    """
+    import json
+    import os
+    import tempfile
+
+    cli, overrides, config_path = _split_engine_extra_args(extra_args)
+    if not overrides:
+        if config_path:
+            cli.extend(['--generation_config', config_path])
+        return cli, None
+
+    if config_path:
+        base_path = Path(config_path)
+        if not base_path.is_absolute():
+            base_path = Path(engine_dir) / base_path
+    else:
+        base_path = Path(engine_dir) / 'generation_config.json5'
+    base = _load_generation_config_file(base_path) if base_path.exists() else {}
+    base.update(overrides)
+    fd, tmp_name = tempfile.mkstemp(prefix='hdeg_gencfg_', suffix='.json')
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        json.dump(base, f, ensure_ascii=False, indent=2)
+    return cli, Path(tmp_name)
+
+
 def _run_transcription_if_needed(work_dir: Path, ctx: PipelineContext,
                                  on_group_ready: Callable[[str], None] = None) -> None:
     """检测音频文件，自动调用 infer.exe 转录生成 .ja.lrc
@@ -3041,8 +3199,19 @@ def _run_transcription_if_needed(work_dir: Path, ctx: PipelineContext,
     if isinstance(_extra_args, str):
         _extra_args = _extra_args.split()
     _extra_args = [str(_a) for _a in _extra_args if str(_a).strip()]
-    for _a in (_extra_args or auto_args):
+    try:
+        _cli_extra, _tmp_cfg = _prepare_engine_extra_args(_extra_args, exe_path.parent)
+    except ValueError as _cfg_err:
+        _log(f"[转录] extra_args 中的引擎配置参数无法应用: {_cfg_err}")
+        _log("[转录] 已跳过本次转录，避免以错误配置继续"
+             "（请修正 extra_args 或 infer.exe 同目录的 generation_config.json5）")
+        return
+    # 用户显式配置优先；只有完全没写 extra_args 时才用按显存推导的自动参数
+    for _a in (_cli_extra if _extra_args else auto_args):
         cmd.append(_a)
+    if _tmp_cfg is not None:
+        cmd.extend(['--generation_config', str(_tmp_cfg)])
+        _log(f"[转录] 已合并 generation_config 参数到临时配置: {_tmp_cfg.name}")
     cmd.append(str(work_dir))
 
     _log(f"[转录] {' '.join(cmd)}")
@@ -3123,6 +3292,11 @@ def _run_transcription_if_needed(work_dir: Path, ctx: PipelineContext,
     finally:
         # 无论 infer 正常结束、失败还是被杀，都对已产出的字幕做收尾归档
         watcher.finish()
+        if _tmp_cfg is not None:
+            try:
+                _tmp_cfg.unlink()
+            except OSError:
+                pass
 
     _log(f"[转录] 实时归档完成: {watcher.settled_count()} 个 .ja.lrc")
 

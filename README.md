@@ -154,7 +154,11 @@ HDEG 不绑定单一厂商。模型行为由 `config.json → api.models` 注册
   }
   ```
 
-  `--smart_split_with_vad=false` 解决"一句一句转录"（关掉按 VAD 逐块切分）；`--enable_batching --batch_size=N` 提升吞吐与显存利用率；`int8_float16` 只省显存、反而更慢且精度略低。低显存机器改回方式见《使用说明.md》。`extra_args` 非空时即为最终生效值，运行时按显存自动调参让位；打包脚本会强制写入这组默认值。
+  `--smart_split_with_vad=false` 解决"一句一句转录"（关掉按 VAD 逐块切分）；`--enable_batching --batch_size=N` 提升吞吐与显存利用率；`int8_float16` 只省显存、反而更慢且精度略低。低显存机器改回方式见《使用说明.md》。`extra_args` 非空时即为最终生效值，运行时按显存自动调参让位；打包脚本只在 `extra_args` 缺省时写入默认值，显式配置会保留。
+
+- `extra_args` 里的 `--vad_filter`、`--no_speech_threshold`、`--beam_size` 不属于 infer 的命令行参数，
+  HDEG 会自动合并进 `infer.exe` 同目录的 `generation_config.json5` 并用临时配置传给引擎；
+  其余参数仍按命令行透传。详见《使用说明.md》。
 
 更多参数说明见《使用说明.md》。
 

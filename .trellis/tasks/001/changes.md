@@ -145,6 +145,24 @@
 - 完整 exe 离线冒烟通过：parsed_count 独立返回、请求诊断、内嵌 translation.txt、pyopenjtalk.g2p。
   最终全量 125 passed、1 deselected、1 条既有弃用警告；未调用真实翻译 API。
 
+## 2026-11-16 extra_args 引擎配置键自动分流
+
+- 背景：`infer.exe` 的 CLI 未暴露 `--vad_filter`、`--no_speech_threshold`、`--beam_size`，
+  用户写进 `extra_args` 会被 argparse 以 `unrecognized arguments` 拒绝；但引擎会从同目录
+  `generation_config.json5` 读取并透传给 faster-whisper。
+- `pipeline/orchestrator.py` 新增 `_split_engine_extra_args`、`_load_generation_config_file`、
+  `_prepare_engine_extra_args`：从 `extra_args` 提取三个引擎配置键，与引擎原配置（容忍
+  `//`、`/* */` 注释和尾逗号）合并后写入临时配置，通过 `--generation_config` 传给 infer；
+  转录结束（含异常/被杀）删除临时文件。其余参数原样 CLI 透传。
+- 失败处理：配置解析失败（复杂 JSON5 等）明确报错并跳过本次转录，不静默丢弃配置。
+- `build_release.py`：仅当 `extra_args` 缺省时写入 batch32 默认值；用户显式配置保留。
+- 测试：新增 `tests/test_transcription_engine_args.py` 8 项（拆分、空格形式、类型错误、
+  原配置保留、无基础文件、`--generation_config` 继承、复杂 JSON5 报错），全量 133 passed。
+- 文档：`使用说明.md`、`README.md` 同步分流规则与优先级。VAD 交互语义经引擎源码核实后修正：
+  `smart=true`+`vad_filter=true` 时两层 VAD 同时生效（此前文档误写为"vad_filter 被置 false"；
+  该行为只出现在 `smart=false` 路径）。
+- 未调用 infer 实际转录、未打包、未提交推送。
+
 ## 环境与打包经历（非业务代码变更）
 
 - 最初 GitHub 直连失败，先下载快照，后重试取得 Git 仓库；后续 origin 指向用户仓库 hz121315/HDEG。

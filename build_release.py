@@ -659,11 +659,19 @@ def copy_config():
         # 显式 extra_args 非空时运行时 auto_tune 自动参数让位，本配置即为最终生效值。
         # 低显存机器改回 int8_float16 / 更小 batch 见《使用说明.md》。
         config["transcription"]["compute_type"] = "float16"
-        config["transcription"]["extra_args"] = [
-            "--enable_batching", "--batch_size=32", "--smart_split_with_vad=false"
-        ]
-        print("  设置转录默认: compute_type=float16, "
-              "extra_args=[--enable_batching, --batch_size=32, --smart_split_with_vad=false]")
+        # 用户在 config.json 显式写了 extra_args 时保留，不再强制覆盖；
+        # 只有缺省时才写入发布件默认的高性能参数。
+        _user_extra = config["transcription"].get("extra_args")
+        if isinstance(_user_extra, str):
+            _user_extra = _user_extra.split()
+        if _user_extra:
+            print(f"  保留用户 extra_args: {_user_extra}")
+        else:
+            config["transcription"]["extra_args"] = [
+                "--enable_batching", "--batch_size=32", "--smart_split_with_vad=false"
+            ]
+            print("  设置转录默认: compute_type=float16, "
+                  "extra_args=[--enable_batching, --batch_size=32, --smart_split_with_vad=false]")
     
     with open(config_dst, 'w', encoding='utf-8') as f:
         json.dump(config, f, ensure_ascii=False, indent=2)
