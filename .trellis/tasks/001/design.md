@@ -66,3 +66,48 @@ extra_args 追加在固定 infer 参数之后、根目录之前。数组适合�
 保留集成版的成果及时落盘、作品级调度和不重复转录思想；不搬硬链接 exe、junction 临时资源、独立翻译 CMD、固定 D 盘临时目录和 Cline 专用代理。
 
 精度／性能不能绝对化：FP16 和 INT8_FLOAT16 的速度、识别差异取决于模型、硬件和解码参数；显存占用不是吞吐指标；逐句日志也不证明没有 batching。历史会话中“FP16 必然更快／占用必然增大”等措辞不作为设计保证。
+
+## 2026-11 追加设计
+
+### NSFW 多级降级
+
+单音轨内按整轨为单位逐级更换上下文，块级快速失败（任一 ≥5 行块 `parsed_count==0` 即终止本级）：
+L1 完整上下文 → L2 和谐版世界观 → L3 仅和谐版角色表 → L4 纯文本。任一级成功即写目标；
+L4 仍失败则跳过并计入 skipped，不再进入轮级重试队列（同上下文重翻价值低）。
+和谐版 LLM 生成后落盘 `和谐版.worldview.json`，per-RJ 锁 + 双重检查防同组并发重复生成；
+生成失败时跳过依赖它的级别，L4 仍可执行。开关关闭时仅 L1，失败回旧轮级重试。
+
+### 独立上下文引擎与 Prompt
+
+`_get_context_engine` 深拷贝全局配置，仅覆盖 `api.worldview`/`api.harmonize` 的
+endpoint 字段与 `generation_params`；全空时复用翻译引擎，只配参数也建独立引擎。
+`_load_rules_prompt` 分别读取世界观/和谐化的自定义规则文件；内置【输出要求】始终附加。
+翻译基础 prompt 抽离为 `prompts/translation.txt`（源码/发布目录/exe 内嵌三处同源），
+台本优先级与字幕标点改为代码常量，不受自定义文件替换。
+
+### 请求诊断
+
+三种协议在请求体裁剪完成后采集白名单设置；单次 chat 的本地列表随响应/异常传递，
+不使用共享 `_last_*` 字段。OpenAI 记录粒度为 SDK 调用（可能含 SDK 内部重试），
+Anthropic/Responses 为 HTTP 请求；时间带时区，响应模型缺失时标注未知。
+不记录 headers、messages、URL 或任意扩展配置，避免凭证与提示词泄露。
+
+### parsed_count 局部化
+
+解析计数与译文一起作为单次调用返回值传递，不再写引擎实例字段；内部空结果重试
+采用哪次响应就同步采用哪次计数。对外 `parse_json_translation` 保持双返回值兼容。
+
+### extra_args 引擎配置键分流
+
+`--vad_filter`/`--no_speech_threshold`/`--beam_size` 不在 infer CLI 中，但引擎会从
+`generation_config.json5` 读取。HDEG 在启动前把它们从 argv 拆出，与引擎同目录配置
+（容忍注释/尾逗号）合并到临时文件，通过 `--generation_config` 传入；转录结束删除。
+解析失败明确报错并跳过本次转录。命令行参数仍优先于配置文件。
+`smart=true` 依赖 `vad_filter=true`；该组合会同时启用外层分块与块内过滤（双层 VAD）。
+
+### 发布交付
+
+打包仍输出 `temp/`；曾将产物复制到根目录 `release/` 并尝试 Git LFS，
+但 GitHub 拒绝公开 fork 上传新 LFS 对象，且 exe 超过普通 Git 100 MiB 上限，已回滚。
+仓库不保存 exe；需要时本地 `build_release.py` 生成。打包脚本仅在 `extra_args` 缺省时
+写入默认值，显式配置保留；发布目录被占用时清空复用，不中断打包。

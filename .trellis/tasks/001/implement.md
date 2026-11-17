@@ -25,6 +25,29 @@
 - [ ] 视频字幕开关、skip统计、汉化过滤一致。
 - [ ] 干净环境可复现完整pyopenjtalk成品；最新exe真实运行验证。
 
+## 2026-11-17 追加实现（对应提交 2fcc74ca..46d709c7）
+
+- [x] NSFW 四段降级重试 + 和谐版文件生成/复用 + 失败日志（音频同名 log）。
+- [x] `api.worldview` / `api.harmonize` 独立端点与 `generation_params`；两套规则 prompt 可自定义。
+- [x] 翻译基础 prompt 抽离 `prompts/translation.txt`；台本/标点写死内置；发布件默认引用与 exe 内嵌。
+- [x] `parsed_count` 单次调用局部返回，修复共享引擎并发误判；内部重试计数与所采用响应一致。
+- [x] 失败请求诊断：时间/模型/协议/记录粒度/最终参数白名单，覆盖翻译、worldview、harmonize。
+- [x] `extra_args` 引擎配置键分流到临时 `generation_config`，原配置合并保留。
+- [x] 默认转录参数改为 smart VAD 六项组合；打包保留用户显式 `extra_args`。
+- [x] 测试：新增 `test_nsfw_fallback.py`、`test_translation_prompt.py`、
+  `test_failure_log_diagnostics.py`、`test_translation_count_isolation.py`、
+  `test_api_request_diagnostics.py`、`test_transcription_engine_args.py`；离线全量 133 passed。
+- [x] 打包验证：frozen exe 冒烟（prompt 内嵌、pyopenjtalk、计数隔离、请求诊断、参数分流）。
+- [x] 根目录 `release/` 入库回滚；仓库不保存 exe，打包输出仍为 `temp/`。
+
+## 仍需真实环境验收（不能打勾）
+
+- [ ] 默认 smart VAD 六项参数在真实音频上的识别质量/耗时/显存占用对比。
+- [ ] 多音轨并发下四级降级、和谐版复用、失败日志的真实端到端表现。
+- [ ] Magpie/Antigravity 的 `the reply ended before it was complete` 502 根因（外部服务）。
+- [ ] 发布件预置 `main.exe` 的真实双击/拖拽运行（仓库不包含 exe）。
+- [ ] verification.md 中其余 001 原始缺口（进度窗、流式日志、重试源路径、归档边界等）。
+
 ## 接续工作顺序
 
 1. 先读 README.md、prd.md、design.md、parameters.md、verification.md，确定用户接受的存在性规则，不恢复早期语言判定。

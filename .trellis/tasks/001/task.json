@@ -8,7 +8,7 @@
   "base_branch": "main",
   "parent": null,
   "children": [],
-  "commit": "cacf5e7c",
+  "commit": "46d709c7",
   "pr_url": null,
   "meta": {
     "record_type": "retrospective",
@@ -16,9 +16,9 @@
     "implementation_period": "2026-10-30 至 2026-11-10（依据会话与提交记录）",
     "repository": "https://github.com/hz121315/HDEG",
     "trellis_initialized": false,
-    "status_reason": "实现及发布已有提交，但静态核查发现流式进度、日志、重试与归档边界缺口，未做完整端到端验收，不能标为 completed。",
-    "latest_verified_baseline": "cacf5e7c",
-    "verification": "本轮只读核实源码及 Git 记录，未重新运行测试、构建、真实 GPU 转录或远程 API 请求。",
+    "status_reason": "核心改造与 2026-11-10 至 17 的追加能力已完成并有自动化测试覆盖；但仍缺真实音频/API 端到端验收及 001 原始缺口（进度窗、流式日志、重试源路径等），不能标为 completed。",
+    "latest_verified_baseline": "46d709c7",
+    "verification": "2026-11-17：离线全量 133 passed、1 deselected；frozen exe 冒烟与发布配置校验通过。未做真实 GPU 转录、真实计费 API 或完整端到端验收。",
     "artifacts": [
       "README.md",
       "prd.md",
@@ -27,6 +27,7 @@
       "changes.md",
       "parameters.md",
       "verification.md"
-    ]
+    ],
+    "progress_synced_on": "2026-11-17"
   }
 }

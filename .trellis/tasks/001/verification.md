@@ -6,6 +6,8 @@
 - 历史会话：曾记录离线测试 54 项通过、多个约 117–119MB 发布产物构建成功；早期曾在 frozen exe 用 --run-script 检查 g2p。
 - 这些历史结果不能证明最新发布入口、多根交叠、所有中断时序和真实最小化窗口均已验收。
 - 路径行号以基线 cacf5e7c 的当前工作区为准，后续修改后请按符号定位。
+- **最新一轮（2026-11-17）的自动化、打包与 frozen exe 证据见文末“进度同步”**；
+  该节计数与结论覆盖本节的历史口径。
 
 ## 已确认的实现
 
@@ -69,3 +71,44 @@
 - 干净发布环境测试 frozen g2p、词典离线可用、BAT多目录以及真实 infer 参数。
 
 以上是待后续批准的修复／验收方向，不构成本轮新增需求或自动执行授权。
+
+## 2026-11-17 进度同步（最新证据）
+
+### 自动化与打包
+
+- 离线全量：`pytest -m "not live"` → **133 passed, 1 deselected**；唯一警告为既有
+  `pkg_resources` 弃用提示。
+- 新增测试文件：`test_nsfw_fallback.py`、`test_translation_prompt.py`、
+  `test_failure_log_diagnostics.py`、`test_translation_count_isolation.py`、
+  `test_api_request_diagnostics.py`、`test_transcription_engine_args.py`。
+- frozen exe 冒烟（`main.exe --run-script`）通过：`prompts/translation.txt` 内嵌可读、
+  `pyopenjtalk.g2p` 可用、`parsed_count` 局部返回、请求诊断可生成、
+  `--vad_filter/--no_speech_threshold/--beam_size` 分流合并正确。
+- 发布件 `temp/config.json` 验证：默认 `compute_type=float16`，`extra_args` 为
+  smart VAD 六项；`prompts` 三处引用存在；凭证已清空。exe 约 117.23 MB。
+- 最新提交：`46d709c7`（远端 main 与本地一致）。此前 `release/` 入库尝试因
+  GitHub 公开 fork 禁止上传新 LFS 对象、exe 超过普通 Git 单文件上限而回滚。
+
+### 本轮已确认修复／实现
+
+| 项目 | 位置 |
+| --- | --- |
+| NSFW 四级降级、和谐版生成/复用、失败日志 | `pipeline/orchestrator.py`（`translate_one_lrc`、`_ensure_harmonized_worldview`） |
+| 独立 `api.worldview`/`api.harmonize` 与 `generation_params` | `pipeline/orchestrator.py`（`_get_context_engine`） |
+| Prompt 抽离/规则替换/内置输出要求 | `engines/translate_engine.py`、`engines/worldview_engine.py`、`prompts/translation.txt` |
+| `parsed_count` 并发隔离 | `engines/translate_engine.py`（`_parse_json_translation_with_count`） |
+| 请求诊断（时间/模型/参数白名单） | `engines/api_client.py`、`engines/translate_engine.py`、`pipeline/orchestrator.py` |
+| `extra_args` 引擎配置键分流 | `pipeline/orchestrator.py`（`_prepare_engine_extra_args` 等） |
+| 默认转录参数 smart VAD 六项 | `build_release.py`、`config.example.json`、本地 `config.json` |
+
+### 仍未验证／已知边界
+
+- **未做真实 GPU 转录与真实计费 API 回归**；默认 smart VAD 组合对识别质量、耗时、
+  显存的实际影响没有实测数据。
+- **Magpie 502 未闭环**：失败发生在 Magpie 将 Antigravity 上游回复判为“不完整”时，
+  不是 HDEG 解析错误；缺少该失败请求的原始上游事件，不能定性为内容拒绝或参数问题。
+  手动以同接口/模型/参数做中性文本与真实 FreeTalk 片段测试均成功，不能复现原失败。
+- **双层 VAD 语义**：`smart=true` + `vad_filter=true` 会同时启用外层分块与块内过滤；
+  相关说明已按引擎源码修正，但仍需真实音频验证是否过度切分。
+- 001 原始缺口（进度窗真实进度、流式日志、重试 source_path、归档边界等）仍未逐项验收。
+- 发布件不包含 `infer.exe` 与转录模型；仓库不包含 `main.exe`，需本地打包。

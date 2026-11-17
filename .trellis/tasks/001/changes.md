@@ -49,9 +49,10 @@
 
 ## 2026-11-10 发布默认转录参数（用户确认目标机 9700X + 32G + 5070 Ti）
 
-- `build_release.py` copy_config：transcription 段强制写入 `compute_type=float16` +
+- `build_release.py` copy_config：transcription 段写入 `compute_type=float16` +
   `extra_args=["--enable_batching", "--batch_size=32", "--smart_split_with_vad=false"]`
   （与既有 infer_exe/model_dir 发布相对路径改写并列；extra_args 非空时运行时 auto_tune 让位）。
+  注：2026-11-16 起改为仅在 `extra_args` 缺省时写入默认值，用户显式配置保留。
 - `config.example.json`、本地 `config.json`（gitignored）transcription 段同步为同组默认值。
 - `使用说明.md` / `README.md`：默认参数说明、低显存回退方式；`.trellis parameters.md` 同步记录。
 - auto_tune 代码未动：显式 extra_args 时自动参数已让位，显式 float16 与 ≥10GB 自动改写一致。
@@ -174,6 +175,26 @@
 - 文档：`使用说明.md` 新增参数作用与新旧默认值对照表；`README.md` 同步默认值摘要。
 - `build_release.py` 增加 Windows 兜底：发布目录被资源管理器/终端占用、`rmtree` 失败时，
   清空内容后复用目录，不再因 `WinError 32` 中断打包。
+
+## 2026-11-17 进度同步（提交 2fcc74ca..46d709c7）
+
+| 提交 | 主题 |
+| --- | --- |
+| 2fcc74ca | 隔离翻译解析计数并完善请求诊断日志 |
+| 8e1d2706 | 移除 `release/` 目录（exe 超出 GitHub 单文件限制） |
+| 105749e7 | 明确 prompts 文件职责与禁止重复内容 |
+| 48e4db1f | `extra_args` 引擎配置键自动分流到 `generation_config` |
+| 46d709c7 | 默认转录参数改为 smart VAD 六项组合 |
+
+当前状态：
+
+- 离线全量 **133 passed, 1 deselected**；frozen exe 冒烟与发布配置校验通过。
+- 最新远端 `main` 与本地一致：`46d709c7`。
+- 默认转录参数：`float16` + `smart_split_with_vad=true`、`vad_filter=true`、
+  `vad_threshold=0.3`、`vad_min_speech_duration_ms=150`、`no_speech_threshold=0.85`、
+  `beam_size=5`。
+- 仓库不保存打包产物；`release/` 入库方案已回滚，本地打包输出仍为 `temp/`。
+- 未做真实 GPU 转录与真实计费 API 回归；Magpie/Antigravity 502 为外部问题，未闭环。
 
 ## 环境与打包经历（非业务代码变更）
 
