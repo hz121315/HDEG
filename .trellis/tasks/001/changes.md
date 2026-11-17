@@ -216,7 +216,10 @@
 - `pipeline/work_windows.py`：进度文件写入加锁；不再把 stdout 重定向到 `DEVNULL`；
   PowerShell 参数统一单引号转义，避免目录名注入。
 - `tests/test_stream_retry_stats.py`：扩至 12 项离线回归；离线全量 145 passed、1 deselected。
-- 未进行真实 GPU/API、Windows 进度窗实机或打包验证；未提交、未推送。
+- 打包：`temp/main.exe` 117.23 MB；frozen exe 冒烟通过（日志键、track buffer、pyopenjtalk、
+  内嵌 translation prompt）；发布 config 凭证已清空。
+- 提交：`c6b499c9`。
+- 未进行真实 GPU/API、Windows 进度窗实机验证。
 
 ## 环境与打包经历（非业务代码变更）
 
