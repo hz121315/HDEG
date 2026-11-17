@@ -157,6 +157,23 @@ def _work_short_id(wkey: str) -> str:
     return f"RJ{_m.group(1)}" if _m else str(Path(str(wkey)).name)
 
 
+def _track_log_key(wkey: str, lrc_path: Path | None) -> str:
+    """作品日志中的音轨键：作品内相对路径（含子目录与扩展名）。
+
+    不能只用文件名：同一作品下 本編/01.lrc 与 特典/01.lrc 会合并成一条记录，
+    导致期望音轨数永远凑不齐、作品日志无法落盘。
+    """
+    if lrc_path is None:
+        return '?'
+    if not wkey:
+        return Path(lrc_path).name
+    try:
+        rel = Path(lrc_path).resolve().relative_to(Path(wkey).resolve())
+        return rel.as_posix()
+    except (ValueError, OSError):
+        return Path(lrc_path).name
+
+
 def _record_track_run(ctx: PipelineContext, wkey: str, task: dict,
                       detail_lines: list, status: str,
                       elapsed: float, reason: str = '') -> None:
@@ -166,16 +183,17 @@ def _record_track_run(ctx: PipelineContext, wkey: str, task: dict,
     某作品全部音轨都有记录时，即写该作品日志文件（重试会更新重写）。
     """
     lrc_path = task.get('lrc_path')
-    fname = lrc_path.name if lrc_path is not None else '?'
+    fname = Path(lrc_path).name if lrc_path is not None else '?'
     if not wkey:
         # 兜底：按文件名反查所属作品（老任务字典可能没有 wkey）
         with ctx.thread_lock:
             for _k, _d in ctx.work_track_runs.items():
-                if fname in _d:
+                if any(_key == fname or _key.endswith('/' + fname) for _key in _d):
                     wkey = _k
                     break
     if not wkey:
         return
+    fname = _track_log_key(str(wkey), lrc_path)
     try:
         attempts = int(task.get('attempts', 0) or 0)
     except (TypeError, ValueError):
@@ -238,7 +256,8 @@ def _write_track_log_file(ctx: PipelineContext, wkey: str, short: str,
     try:
         track_dir = log_dir / _sanitize_log_name(short)
         track_dir.mkdir(parents=True, exist_ok=True)
-        stem = Path(fname).stem
+        # 相对键可能带子目录：main/01.lrc → main_01.log，避免同名轨互相覆盖
+        stem = str(Path(fname).with_suffix(''))
         out = [
             f"音轨: {fname}  作品: {short}",
             f"生成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}",
@@ -403,17 +422,22 @@ def _mark_tracks_final_failed(ctx: PipelineContext, still_list: list) -> None:
             try:
                 _task = _sf if isinstance(_sf, dict) else {}
                 _lp = _task.get('lrc_path')
-                _fname = _lp.name if _lp is not None else None
+                _fname = Path(_lp).name if _lp is not None else None
                 # wkey 优先取任务自带，否则按 runs 表反查
                 _wk = str(_task.get('wkey') or '')
                 if not _wk and _fname:
                     for _k, _d in ctx.work_track_runs.items():
-                        if _fname in _d:
+                        if any(_key == _fname or _key.endswith('/' + _fname) for _key in _d):
                             _wk = _k
                             break
-                if _wk and _fname and _fname in ctx.work_track_runs.get(_wk, {}):
-                    ctx.work_track_runs[_wk][_fname]['status'] = '最终失败'
-                    _affected.add(_wk)
+                if _wk and _lp is not None:
+                    _key = _track_log_key(_wk, _lp)
+                    if _key not in ctx.work_track_runs.get(_wk, {}):
+                        # 兼容旧键（仅文件名）
+                        _key = _fname
+                    if _key in ctx.work_track_runs.get(_wk, {}):
+                        ctx.work_track_runs[_wk][_key]['status'] = '最终失败'
+                        _affected.add(_wk)
             except Exception:
                 continue
     for _wk in _affected:
@@ -597,6 +621,12 @@ class PipelineContext:
         self.work_expected_counts: dict = {}
         # 已播报过日志文件的作品（避免控制台重复提示）
         self._work_log_announced: set = set()
+        # 已计入 skipped 的文件路径（规范化小写）。流式路径会多次扫描同一目录，
+        # 多根重叠时同一文件也会被重复看到；skipped 是文件数口径，必须去重。
+        self._skip_counted_keys: set = set()
+        # 本次运行已认领翻译的目标路径。扫描与翻译并行时，翻译成功后收尾补扫
+        # 会再次看到该 A.lrc；不能把本轮成果误计为"已有译文跳过"。
+        self._translation_claimed_keys: set = set()
         # 失败音轨最大重试次数：app.translate_failed_max_retries，默认 3
         try:
             _mfr = int(self.app_cfg.get('translate_failed_max_retries', 3) or 3)
@@ -910,6 +940,47 @@ def _audio_exts_from_config(ctx: PipelineContext) -> set[str]:
     return exts or {'.mp3'}
 
 
+def _path_key(path: Path) -> str:
+    """路径统计键：规范化绝对路径 + 小写，兼容 Windows 大小写。"""
+    try:
+        return str(Path(path).resolve()).lower()
+    except OSError:
+        return str(path).lower()
+
+
+def _count_skipped_once(ctx: PipelineContext, key: Path, reason: str) -> None:
+    """按规范化路径去重计入 skipped。
+
+    _collect_translation_pairs 会被流式路径反复调用（初始扫描、作品派发、收尾补扫），
+    多根重叠时同一文件也会被多次看到；skipped 统计的是文件个数，不能随扫描次数增长。
+    本轮已认领翻译的目标即使已被写出，也不算"跳过"。
+    """
+    _k = _path_key(key)
+    with ctx.thread_lock:
+        _seen = getattr(ctx, '_skip_counted_keys', None)
+        if _seen is None:
+            _seen = set()
+            setattr(ctx, '_skip_counted_keys', _seen)
+        if _k in _seen:
+            return
+        _claimed = getattr(ctx, '_translation_claimed_keys', None)
+        if _claimed and _k in _claimed:
+            return
+        _seen.add(_k)
+        ctx.stats['skipped'] += 1
+    _debug(reason)
+
+
+def _claim_translation_target(ctx: PipelineContext, target: Path) -> None:
+    """记录本次运行已认领的翻译目标，供后续扫描排除。"""
+    with ctx.thread_lock:
+        _claimed = getattr(ctx, '_translation_claimed_keys', None)
+        if _claimed is None:
+            _claimed = set()
+            setattr(ctx, '_translation_claimed_keys', _claimed)
+        _claimed.add(_path_key(target))
+
+
 def _collect_translation_pairs(work_dir: Path, ctx: PipelineContext,
                                only: set[Path] | None = None) -> tuple[list[Path], dict, dict]:
     """按「A.lrc 存在即已完成」收集待翻译任务。
@@ -953,8 +1024,8 @@ def _collect_translation_pairs(work_dir: Path, ctx: PipelineContext,
         if not _in_scope(f):
             continue
         if skip_hanhua and _is_hanhua_audio(f):
-            ctx.stats['skipped'] += 1
-            _debug(f"跳过汉化文件: {f.name}")
+            # 统计键用同名目标字幕，使"音频 + JA 留档"归并为同一轨，只计一次
+            _count_skipped_once(ctx, _lrc_for_audio(f), f"跳过汉化文件: {f.name}")
             continue
         audios.append(f)
 
@@ -968,22 +1039,28 @@ def _collect_translation_pairs(work_dir: Path, ctx: PipelineContext,
             continue
         stem = ja.name[:-len('.ja.lrc')]
         target = ja.with_name(f'{stem}.lrc')
+        # 汉化音频若同时存在 .ja.lrc，音频扫描阶段已过滤而这里仍会把它当源；
+        # 必须按同一规则跳过，避免开关对"有 JA 留档的汉化轨"失效。
+        if skip_hanhua and stem.endswith(_HANHUA_SUFFIXES):
+            _count_skipped_once(ctx, target, f"跳过汉化文件: {ja.name}")
+            continue
         audio = audio_by_target.get(target)
-        if audio is not None and _is_hanhua_audio(audio):
+        # 仅在开关开启时按汉化过滤；关闭时该轨必须正常翻译
+        if skip_hanhua and audio is not None and _is_hanhua_audio(audio):
             continue
         if target.exists():
-            ctx.stats['skipped'] += 1
-            _debug(f"已存在译文，跳过: {target.name}")
+            _count_skipped_once(ctx, target, f"已存在译文，跳过: {target.name}")
             continue
         targets.append(target)
+        _claim_translation_target(ctx, target)
         source_map[target] = ja
         if audio is not None:
             audio_map[target] = audio
 
     # 有音频、已有 A.lrc 的也计入跳过（规则：存在即完成）
-    for audio, target in audio_by_target.items():
+    for target in audio_by_target:
         if target.exists() and target not in source_map:
-            ctx.stats['skipped'] += 1
+            _count_skipped_once(ctx, target, f"已存在译文，跳过: {target.name}")
 
     return targets, source_map, audio_map
 
@@ -2180,7 +2257,8 @@ def _enqueue_failed_track(ctx: PipelineContext, task: dict, reason: str) -> None
         # 首轮失败才计 abnormal_count，重试轮次失败不重复计
         if _attempts <= 0:
             ctx.abnormal_count += 1
-        ctx.retry_results[task['lrc_path'].name] = f'失败: {reason}'
+        ctx.retry_results[_track_log_key(str(task.get('wkey') or ''),
+                                        task['lrc_path'])] = f'失败: {reason}'
 
 
 # ==================== NSFW 多级降级重试辅助 ====================
@@ -2485,6 +2563,15 @@ def translate_one_lrc(
     if source_path != target_path:
         _log(f"  源字幕: {source_path.name}")
 
+    def _emit_progress(line: str) -> None:
+        """块级进度回调（写作品进度窗）；回调异常不得影响翻译。"""
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(line)
+        except Exception:
+            pass
+
     # 使用通用字幕解析器（支持 LRC/SRT/VTT）
     sub_file = parse_subtitle_file(source_path)
     if sub_file is None:
@@ -2494,6 +2581,7 @@ def translate_one_lrc(
     texts = sub_file.original_lyrics
     total_chars = sum(len(t) for t in texts)
     _log(f"  [解析] {len(texts)} 行文本, {total_chars} 字符")
+    _emit_progress(f"[{target_path.name}] 解析 {len(texts)} 行")
 
     if total_chars == 0:
         _log(f"  [跳过] 原文内容为空（仅有时间戳），跳过翻译")
@@ -2608,7 +2696,7 @@ def translate_one_lrc(
     # app.nsfw_fallback_enabled=false 时仅第1级，失败走旧逻辑进入轮级重试队列。
     _fallback_on = bool(getattr(ctx, 'nsfw_fallback_enabled', False))
 
-    def _run_pass(pass_terms, pass_alias, pass_worldview) -> dict:
+    def _run_pass(pass_terms, pass_alias, pass_worldview, level_no: int = 1) -> dict:
         """以指定上下文完整跑一遍分块翻译（供多级降级重试逐级调用）。
 
         返回: {ok, reason, raw, translated, hit, miss, prompt, comp,
@@ -2639,8 +2727,10 @@ def translate_one_lrc(
 
             if _use_chunk:
                 _log(f"  [块 {_ci+1}/{len(_chunks)}] 行 {_chunk_idx[0]+1}-{_chunk_idx[-1]+1}，发送请求...")
+                _emit_progress(f"[{target_path.name}] L{level_no} 块 {_ci+1}/{len(_chunks)}")
             else:
                 _log(f"  → 时间: {time.strftime('%H:%M:%S')}, 发送请求...")
+                _emit_progress(f"[{target_path.name}] L{level_no} 整文件翻译")
             _call_start = time.time()
             try:
                 result = ctx.translate_engine.translate_batch(
@@ -2754,7 +2844,7 @@ def translate_one_lrc(
         if _lv > 1:
             _log(f"\n[降级重试] {lrc_path.name}: {_lv_desc}", console=True)
 
-        _pass_res = _run_pass(_pt, _pa, _pw)
+        _pass_res = _run_pass(_pt, _pa, _pw, _lv)
 
         # token 统计：本级无论成败都记录（费用已实际发生）
         usage = TokenUsage(
@@ -2776,6 +2866,8 @@ def translate_one_lrc(
         if _pass_res['ok']:
             translated_texts = _pass_res['translated']
             _eff_terms, _eff_alias, _eff_worldview = _pt, _pa, _pw
+            # 此时仅拿到译文，尚未润色/写盘；不能提前宣布音轨完成
+            _emit_progress(f"[{target_path.name}] 译文已返回 {len(translated_texts)} 行")
             break
 
         # ── 本级失败：打印诊断 + 写音频同名失败日志（仅多级降级开启时），准备降级 ──
@@ -2804,9 +2896,10 @@ def translate_one_lrc(
             # 统计口径与"原文为空"等内部跳过分支一致；retry_results 不以"失败"
             # 开头，避免批式/串行外层误判为"待重试"（实际已无重试）。
             _log(f"  [异常翻译] {lrc_path.name}: 多级降级重试全部失败，跳过该音轨", console=True)
+            _emit_progress(f"[{target_path.name}] 多级降级失败，跳过")
             with ctx.thread_lock:
                 ctx.stats['skipped'] += 1
-            ctx.retry_results[lrc_path.name] = f'多级降级后跳过: {_final_reason}'
+            ctx.retry_results[_track_log_key(wkey or _wkey_eff, lrc_path)] = f'多级降级后跳过: {_final_reason}'
             return False
         # 开关关闭：维持旧行为，不写文件、进入轮级重试队列
         _max_r = getattr(ctx, 'max_failed_retries', 3)
@@ -2814,8 +2907,10 @@ def translate_one_lrc(
              f"（已尝试 {attempts} 次，最多重试 {_max_r} 次）")
         _enqueue_failed_track(ctx, {
             'lrc_path': lrc_path,
+            'source_path': source_path,
+            'target_path': target_path,
             'label': label,
-            'wkey': wkey,
+            'wkey': wkey or _wkey_eff,
             'terms': terms,
             'alias_list': alias_list,
             'worldview': worldview,
@@ -2892,6 +2987,7 @@ def translate_one_lrc(
     _log(f"  -> 翻译完成: {len(translated_texts)} 行中文（已去除空行）")
     with ctx.thread_lock:
         ctx.stats['translated'] += 1
+    _emit_progress(f"[{target_path.name}] 完成 {len(translated_texts)} 行")
 
     # 同步中文到同目录的 SRT/VTT
     sync_lrc_to_srt_vtt(target_path, translated_texts)
@@ -3472,7 +3568,11 @@ def _analyze_group_stream(ctx: PipelineContext, wkey: str, targets: list[Path]):
 
 
 def _translate_task_stream(ctx: PipelineContext, task: dict) -> bool:
-    """流式路径的单音轨任务：复用 translate_one_lrc，失败进现有重试队列。"""
+    """流式路径的单音轨任务：复用 translate_one_lrc，失败进现有重试队列。
+
+    与批式路径一致地保留逐轨缓冲：成功时细节随作品日志落盘，失败时整块 dump，
+    并写入 work_track_runs 供作品日志/manifest 使用。
+    """
     from engines.api_client import worker_local, start_track_buffer, stop_track_buffer
     name = threading.current_thread().name
     m = re.search(r'ThreadPoolExecutor-\d+_(\d+)', name)
@@ -3480,29 +3580,84 @@ def _translate_task_stream(ctx: PipelineContext, task: dict) -> bool:
     lrc_path = task['lrc_path']
     label = task.get('label', '')
     attempts = int(task.get('attempts', 0) or 0)
+    _retry_key = _track_log_key(str(task.get('wkey') or ''), lrc_path)
+    _start = time.time()
+    _elapsed = 0.0
+    _ok = False
+    _status = '跳过'
+    _reason = ''
+    _fail_title = ''
     start_track_buffer()
     try:
         _log(f"\n  ▶ 开始音轨: {label} | {lrc_path.name}", console=True)
-        return translate_one_lrc(
+        _ok = translate_one_lrc(
             lrc_path, ctx,
             terms=task.get('terms'),
             alias_list=task.get('alias_list'),
             worldview=task.get('worldview'),
             scriptbook_lines=task.get('scriptbook_lines'),
+            progress_callback=task.get('progress_callback'),
             attempts=attempts,
             label=label,
             wkey=task.get('wkey') or '',
             source_path=task.get('source_path'),
             target_path=lrc_path,
         )
+        _elapsed = time.time() - _start
+        if _ok:
+            if attempts > 0:
+                with ctx.thread_lock:
+                    ctx.retry_results[_retry_key] = '重试成功'
+            _status = '成功'
+            return True
+        # 只按"本任务是否真的进入重试队列"判定待重试。retry_results 是结果汇总，
+        # 可能被同名轨或旧轮次覆盖，不能单凭它推断当前任务状态。
+        with ctx.thread_lock:
+            _queued = next(
+                (t for t in ctx.retry_queue if t.get('lrc_path') == lrc_path),
+                None,
+            )
+        if _queued is not None:
+            _status = '失败待重试'
+            _reason = str(_queued.get('fail_reason', '') or '')
+            _fail_title = f"{lrc_path.name} 翻译失败现场"
+            _log(f"  ✗ 翻译失败（待重试，已尝试 {attempts} 次，"
+                 f"最多重试 {ctx.max_failed_retries} 次）: {lrc_path.name}", console=True)
+        else:
+            # 空文本跳过 / 多级降级耗尽后跳过：translate_one_lrc 已计入 skipped
+            _status = '跳过'
+            _rr = str(ctx.retry_results.get(_retry_key, '') or '')
+            _reason = _rr if _rr.startswith('多级降级后跳过') else ''
+            _fail_title = f"{lrc_path.name} 跳过现场"
+        return False
     except Exception as e:
+        _elapsed = time.time() - _start
+        _reason = f"[异常] {e}"
+        _fail_title = f"{lrc_path.name} 任务异常现场"
         _log(f"  [异常] {lrc_path.name}: {e}", console=True)
         if attempts < ctx.max_failed_retries:
-            _enqueue_failed_track(ctx, task, f"[异常] {e}")
+            _enqueue_failed_track(ctx, task, _reason)
+            _status = '失败待重试'
+        else:
+            # 与批式路径一致：耗尽重试的异常才计 skipped，并标记最终失败
+            with ctx.thread_lock:
+                ctx.stats['skipped'] += 1
+            ctx.retry_results[_retry_key] = f'失败: {_reason}'
+            _status = '最终失败'
         return False
     finally:
+        # 回写本次结论，供重试循环区分成功／跳过／最终失败，不能用空队列代表成功
+        task['_last_status'] = _status
+        task['_last_reason'] = _reason
         try:
-            stop_track_buffer()
+            _buf = stop_track_buffer()
+            _record_track_run(
+                ctx, task.get('wkey'), task,
+                _buf.get('lines') if _buf else [],
+                _status, _elapsed, _reason,
+            )
+            if not _ok and _buf and _buf.get('lines'):
+                _dump_track_buffer(_buf, _fail_title or f"{lrc_path.name} 现场")
         except Exception:
             pass
 
@@ -3514,11 +3669,17 @@ def _process_work_stream(ctx: PipelineContext, wkey: str, pool, windows) -> None
     if not targets:
         return
     windows.open(wkey, _work_label(wkey))
+    windows.write(wkey, f"待翻译音轨 {len(targets)} 个")
     try:
         scriptbook, terms, alias_list, worldview = _analyze_group_stream(ctx, wkey, targets)
         label = _work_label(wkey)
         with ctx.thread_lock:
             ctx.work_expected_counts[wkey] = len(targets)
+
+        def _progress(line: str) -> None:
+            """把 worker 的块级进度写入本作品进度窗（窗口关闭后自动忽略）。"""
+            windows.write(wkey, str(line))
+
         futures = []
         for t in targets:
             sb = None
@@ -3534,6 +3695,7 @@ def _process_work_stream(ctx: PipelineContext, wkey: str, pool, windows) -> None
                 'worldview': worldview,
                 'scriptbook_lines': sb,
                 'attempts': 0,
+                'progress_callback': _progress,
             }
             futures.append(pool.submit(_translate_task_stream, ctx, task))
         for fut in futures:
@@ -3541,6 +3703,7 @@ def _process_work_stream(ctx: PipelineContext, wkey: str, pool, windows) -> None
                 fut.result()
             except Exception:
                 pass
+        windows.write(wkey, "本作品音轨处理结束")
     finally:
         windows.close(wkey)
 
@@ -3654,8 +3817,39 @@ def _run_streaming_pipeline(roots, ctx: PipelineContext) -> dict:
         for t in retry_tasks:
             t['attempts'] = int(t.get('attempts', 0) or 0) + 1
         _log(f"\n  [重试] 第 {_round} 轮，{len(retry_tasks)} 个音轨", console=True)
-        with ThreadPoolExecutor(max_workers=min(ctx.translation_parallel, len(retry_tasks))) as ex:
+        # translation_parallel=0 表示串行：重试至少要 1 个 worker，不能建 0 worker 线程池
+        _max_workers = max(1, min(ctx.translation_parallel or 1, len(retry_tasks)))
+        with ThreadPoolExecutor(max_workers=_max_workers) as ex:
             list(ex.map(lambda t: _translate_task_stream(ctx, t), retry_tasks))
+        # 本轮结论：队列剩余 + 已标记最终失败但不再入队的异常任务
+        _final_now = [t for t in retry_tasks if t.get('_last_status') == '最终失败']
+        with ctx.thread_lock:
+            _still = list(ctx.retry_queue)
+            if _round >= ctx.max_failed_retries:
+                ctx.retry_queue = []
+                # 最终失败的音轨此时才计入 skipped（中间轮次未计数）
+                ctx.stats['skipped'] += len(_still)
+        if _round < ctx.max_failed_retries and _still:
+            _log(f"  [重试] 第 {_round} 轮完成：仍失败 {len(_still)} 个", console=True)
+            continue
+        if _still:
+            _mark_tracks_final_failed(ctx, _still)
+        _final_all = list(_still)
+        for _t in _final_now:
+            if _t not in _final_all:
+                _final_all.append(_t)
+        if _final_all:
+            _log(f"  [重试] 第 {_round} 轮结束，{len(_final_all)} 个音轨最终失败：",
+                 console=True)
+            for _sf in _final_all:
+                _reason = _sf.get('fail_reason') or _sf.get('_last_reason') or ''
+                _log(f"    ✗ {_sf['lrc_path'].name}（原因: {_reason}）", console=True)
+        else:
+            _n_ok = sum(1 for t in retry_tasks if t.get('_last_status') == '成功')
+            _n_skip = sum(1 for t in retry_tasks if t.get('_last_status') == '跳过')
+            _log(f"  [重试] 第 {_round} 轮结束：成功 {_n_ok} 个，跳过 {_n_skip} 个",
+                 console=True)
+        break
 
     windows.close_all()
     _log(f"\n[完成] 翻译 {ctx.stats.get('translated', 0)} 个音轨，"
@@ -4064,6 +4258,7 @@ def run_pipeline(
             lrc_path = task['lrc_path']
             label = task.get('label', '')
             _attempts = int(task.get('attempts', 0) or 0)
+            _retry_key = _track_log_key(str(task.get('wkey') or ''), lrc_path)
             _max_r = getattr(ctx, 'max_failed_retries', 3)
             _start = time.time()
             # 开启逐轨缓冲：本音轨的详细日志只进 buffer，不上控制台；
@@ -4098,9 +4293,9 @@ def run_pipeline(
                     # 否则进度会被陈旧标记误判为失败
                     if success and _attempts > 0:
                         with ctx.thread_lock:
-                            ctx.retry_results[lrc_path.name] = '重试成功'
+                            ctx.retry_results[_retry_key] = '重试成功'
                     # 异常翻译（解析失败/截断/调用异常）→ 主线程进度标记为"失败"并提示待重试
-                    _abnormal = lrc_path.name in ctx.retry_results and ctx.retry_results[lrc_path.name].startswith('失败')
+                    _abnormal = _retry_key in ctx.retry_results and ctx.retry_results[_retry_key].startswith('失败')
                     if ctx.parallel_mode:
                         if _abnormal:
                             ctx.update_work_progress(label, '失败', lrc_path.name + '（翻译失败，待重试）', wid, _start, _elapsed)
@@ -4119,7 +4314,7 @@ def run_pipeline(
                         _fail_title = f"{lrc_path.name} 翻译失败现场"
                         if _abnormal:
                             _run_status = '失败待重试'
-                            _run_reason = ctx.retry_results.get(lrc_path.name, '')
+                            _run_reason = ctx.retry_results.get(_retry_key, '')
                             _log(f"  ✗ 翻译失败（待重试，已尝试 {_attempts} 次，最多重试 {_max_r} 次）: {lrc_path.name}", console=True)
                         else:
                             with ctx.thread_lock:
@@ -4137,6 +4332,8 @@ def run_pipeline(
                     if _attempts < _max_r:
                         _enqueue_failed_track(ctx, {
                             'lrc_path': lrc_path,
+                            'source_path': task.get('source_path'),
+                            'target_path': lrc_path,
                             'label': label,
                             'wkey': task.get('wkey'),
                             'terms': task.get('terms'),
@@ -4361,6 +4558,7 @@ def run_pipeline(
 
                 from engines.api_client import start_track_buffer as _stb, stop_track_buffer as _spb
                 _dir_key = str(_effective_dir)
+                _retry_key = _track_log_key(_dir_key, lrc_path)
                 _s_track = {'lrc_path': lrc_path,
                             'source_path': source_map.get(lrc_path, lrc_path),
                             'label': '', 'wkey': _dir_key, 'attempts': 0}
@@ -4403,12 +4601,12 @@ def run_pipeline(
                             _log(f"\n✓ 文件 [{i+1}/{len(lrc_files)}] 翻译成功: {lrc_path.name}", console=True)
                         else:
                             _is_retryable = (
-                                lrc_path.name in ctx.retry_results
-                                and ctx.retry_results[lrc_path.name].startswith('失败')
+                                _retry_key in ctx.retry_results
+                                and ctx.retry_results[_retry_key].startswith('失败')
                             )
                             if _is_retryable:
                                 _s_status = '失败待重试'
-                                _s_reason = ctx.retry_results.get(lrc_path.name, '')
+                                _s_reason = ctx.retry_results.get(_retry_key, '')
                                 _log(f"\n✗ 文件 [{i+1}/{len(lrc_files)}] 翻译失败（待重试）: {lrc_path.name}", console=True)
                             else:
                                 with ctx.thread_lock:
@@ -4426,6 +4624,8 @@ def run_pipeline(
                         _max_r0 = getattr(ctx, 'max_failed_retries', 3)
                         _enqueue_failed_track(ctx, {
                             'lrc_path': lrc_path,
+                            'source_path': source_map.get(lrc_path, lrc_path),
+                            'target_path': lrc_path,
                             'label': '',
                             'wkey': _dir_key,
                             'terms': _dir_terms,
@@ -4480,6 +4680,7 @@ def run_pipeline(
                     _rt_wkey = _rt.get('wkey') or ''
                     _rt_task = dict(_rt)
                     _rt_task['wkey'] = _rt_wkey
+                    _rt_retry_key = _track_log_key(_rt_wkey, _rt.get('lrc_path'))
                     _r_status = '失败待重试'
                     _r_reason = ''
                     _r_elapsed = 0.0
@@ -4503,10 +4704,10 @@ def run_pipeline(
                             if _rsuccess:
                                 _retry_ok += 1
                                 with ctx.thread_lock:
-                                    ctx.retry_results[_rt['lrc_path'].name] = '重试成功'
+                                    ctx.retry_results[_rt_retry_key] = '重试成功'
                                 _r_status = '成功'
                             else:
-                                _r_reason = ctx.retry_results.get(_rt['lrc_path'].name, '')
+                                _r_reason = ctx.retry_results.get(_rt_retry_key, '')
                                 if not (_r_reason or '').startswith('失败'):
                                     _r_status = '跳过'
                             # 失败时 translate_one_lrc 已重新入队（attempts 为本轮值），无需额外处理
@@ -4516,6 +4717,8 @@ def run_pipeline(
                             _r_reason = f"[重试异常] {_re}"
                             _enqueue_failed_track(ctx, {
                                 'lrc_path': _rt['lrc_path'],
+                                'source_path': _rt.get('source_path'),
+                                'target_path': _rt.get('target_path', _rt['lrc_path']),
                                 'label': _rt.get('label', ''),
                                 'wkey': _rt_wkey,
                                 'terms': _rt.get('terms'),

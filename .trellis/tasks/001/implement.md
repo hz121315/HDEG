@@ -48,6 +48,26 @@
 - [ ] 发布件预置 `main.exe` 的真实双击/拖拽运行（仓库不包含 exe）。
 - [ ] verification.md 中其余 001 原始缺口（进度窗、流式日志、重试源路径、归档边界等）。
 
+## 2026-11-17 续开发（流式重试／统计／日志）
+
+- [x] 失败任务入队保留 `source_path`/`target_path`（翻译内部、并行异常、串行首轮与重试异常）。
+- [x] 流式重试按本轮结果收尾：末轮异常/失败计 `skipped`、标记最终失败并重写作品日志；
+  `translation_parallel=0` 时重试线程池至少 1 个 worker；不再以空队列误报全部成功。
+- [x] `skipped` 按规范化路径去重；同一汉化轨的音频与 JA 归并为一次；关闭汉化开关仍翻译；
+  本轮已认领并写出的目标不再被补扫计为跳过。
+- [x] 作品日志改用作品内相对路径键，同名子目录轨不再合并；单轨日志文件名扁平化。
+- [x] 流式单轨保留逐轨缓冲并写 `work_track_runs`；失败整块 dump；作品完成后写作品日志。
+- [x] 流式状态改为按 `retry_queue` 归属判断；`retry_results` 键改为作品内相对路径，
+  避免跨作品同名轨状态污染。
+- [x] `translate_one_lrc` 增加块级 `progress_callback`；“完成”仅在写盘成功后上报。
+- [x] 进度窗不再重定向 stdout，PowerShell 参数做单引号转义。
+- [x] `tests/test_stream_retry_stats.py` 扩至 12 项；离线全量 145 passed。
+- [ ] 真实 Windows 进度窗 tail/关闭时序、批量 manifest 与真实端到端仍待验收。
+
+```bash
+.venv/Scripts/python.exe -m pytest -m "not live"
+```
+
 ## 接续工作顺序
 
 1. 先读 README.md、prd.md、design.md、parameters.md、verification.md，确定用户接受的存在性规则，不恢复早期语言判定。

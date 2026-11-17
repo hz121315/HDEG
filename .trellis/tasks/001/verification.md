@@ -112,3 +112,48 @@
   相关说明已按引擎源码修正，但仍需真实音频验证是否过度切分。
 - 001 原始缺口（进度窗真实进度、流式日志、重试 source_path、归档边界等）仍未逐项验收。
 - 发布件不包含 `infer.exe` 与转录模型；仓库不包含 `main.exe`，需本地打包。
+
+## 2026-11-17 续开发（流式重试／统计／日志）
+
+### 首轮修复
+
+| 缺口 | 修复 |
+| --- | --- |
+| 重试丢 `source_path` | `translate_one_lrc` 内部入队、批式异常入队、批式重试异常入队保留 `source_path`/`target_path` |
+| 流式重试收尾不完整 | 耗尽重试后计 `skipped`、`_mark_tracks_final_failed` 重写作品日志；`translation_parallel=0` 时重试池至少 1 个 worker |
+| skipped 统计膨胀 | 新增 `_count_skipped_once`；修正 `target→audio` 字典反向解包 |
+| 流式日志/作品日志缺失 | `_translate_task_stream` 保留 `stop_track_buffer` 返回值，写 `work_track_runs`，失败整块 dump |
+| 进度窗无进度 | `translate_one_lrc` 增加块级 `progress_callback`；流式作品写入进度窗 |
+
+复核发现上述修复仍不完整，已补修以下问题：
+
+### 复核补修
+
+| 问题 | 修复 |
+| --- | --- |
+| 同一汉化音轨同时有音频与 JA 时计两次 skipped | 两处统一以同名目标 `.lrc` 作为统计键；`skip_hanhua_files=false` 时不再无条件过滤汉化轨 |
+| 末轮异常后队列为空，日志误报“全部重试成功” | `_translate_task_stream` 回写 `_last_status`/`_last_reason`；重试循环按本轮结果区分成功、跳过、最终失败，不再用空队列代表成功 |
+| 同一作品不同子目录同名轨在作品日志中合并 | 新增 `_track_log_key`，`work_track_runs` 改用作品内相对路径键；单轨日志文件名扁平化为 `main_01.log` |
+| 跨作品同名轨的失败状态污染流式状态 | 流式状态改为检查本任务是否真正进入 `retry_queue`；`retry_results` 键同步改为作品内相对路径 |
+| 串行首轮异常仍丢 `source_path` | 串行 `except` 入队补齐 `source_map` 源路径与目标路径 |
+| 本轮成功写出的 A.lrc 被收尾补扫计为 skipped | 新增 `_translation_claimed_keys`，认领过的目标不再计为“已有译文跳过” |
+| 进度在写盘前显示“完成” | 成功取回译文时只报“译文已返回”；写盘成功并计 `translated` 后才报“完成” |
+| 进度窗 stdout 被 `DEVNULL` 吞掉；目录名单引号可注入 PowerShell | 移除 stdout 重定向；PowerShell 字符串统一经 `_ps_quote` 转义 |
+
+### 验证证据
+
+- `tests/test_stream_retry_stats.py` 扩至 12 项，覆盖：同轨汉化只计一次、关闭开关仍翻译、
+  补扫不重复计本轮成果、同名子目录轨日志隔离、跨作品同名轨状态隔离、末轮异常最终状态、
+  写盘前后进度时序、进度窗 stdout 与引号转义。
+- 离线全量：`pytest -m "not live"` → **145 passed, 1 deselected**；仅有既有
+  `pkg_resources` 弃用警告。
+- 离线 harness 复核 `_run_streaming_pipeline`：末轮异常不再打印“全部重试成功”，
+  正常成功路径 `translated=1` 时 `skipped=0`。
+- 未做真实 GPU 转录、真实计费 API、真实 Windows 进度窗与出版 exe 回归。
+
+### 仍未处理
+
+- 进度窗只验证了参数与转义，未在 Windows 实机确认 `CREATE_NEW_CONSOLE` 下持续 tail、
+  最小化与关闭时序。
+- 流式路径的批量 manifest 未做真实后端联调。
+- 001 其余原始缺口（归档边界、多根入口公共契约、视频字幕开关、硬件覆盖等）未在本轮改动。

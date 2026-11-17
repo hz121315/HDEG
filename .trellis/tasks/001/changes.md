@@ -196,6 +196,28 @@
 - 仓库不保存打包产物；`release/` 入库方案已回滚，本地打包输出仍为 `temp/`。
 - 未做真实 GPU 转录与真实计费 API 回归；Magpie/Antigravity 502 为外部问题，未闭环。
 
+## 2026-11-17 续开发：流式重试／统计／日志接线
+
+- `pipeline/orchestrator.py`：
+  - 失败入队补齐 `source_path`/`target_path`（`translate_one_lrc` 内部、并行异常、串行首轮与重试异常）。
+  - 流式重试循环按本轮结果收尾：末轮异常/失败计 `skipped`、调用 `_mark_tracks_final_failed`
+    重写作品日志；`translation_parallel=0` 时重试线程池取 `max(1, ...)`；不再以空队列误报全部成功。
+  - `_collect_translation_pairs` 的 skipped 改为 `_count_skipped_once` 按规范化路径去重，
+    修正 `target→audio` 字典反向解包；同一汉化轨的音频与 JA 统一以目标字幕为统计键；
+    `skip_hanhua_files=false` 时不再无条件过滤汉化轨。
+  - 新增 `_translation_claimed_keys`：本轮认领并成功写出的 A.lrc 不再被收尾补扫计为跳过。
+  - `_track_log_key` 把作品日志/重试结果改为作品内相对路径键，同名子目录轨不再合并；
+    单轨日志文件名扁平化为 `main_01.log`。
+  - `_translate_task_stream` 保留 `stop_track_buffer` 结果并写 `work_track_runs`，失败整块 dump；
+    状态按本任务是否进入 `retry_queue` 判定，回写 `_last_status`/`_last_reason` 供重试循环使用。
+  - `_process_work_stream` 把块级 `progress_callback` 转发到作品进度窗。
+  - `translate_one_lrc` 在解析、块发送、取回译文、降级耗尽节点触发进度；
+    “完成”只在写盘成功并计 `translated` 后上报。
+- `pipeline/work_windows.py`：进度文件写入加锁；不再把 stdout 重定向到 `DEVNULL`；
+  PowerShell 参数统一单引号转义，避免目录名注入。
+- `tests/test_stream_retry_stats.py`：扩至 12 项离线回归；离线全量 145 passed、1 deselected。
+- 未进行真实 GPU/API、Windows 进度窗实机或打包验证；未提交、未推送。
+
 ## 环境与打包经历（非业务代码变更）
 
 - 最初 GitHub 直连失败，先下载快照，后重试取得 Git 仓库；后续 origin 指向用户仓库 hz121315/HDEG。

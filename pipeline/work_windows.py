@@ -13,6 +13,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 _IS_WINDOWS = sys.platform.startswith('win')
@@ -25,6 +26,11 @@ def _safe_name(text: str) -> str:
     return (out or 'work')[:80]
 
 
+def _ps_quote(text: str) -> str:
+    """PowerShell 单引号字符串：内部单引号翻倍，避免目录名注入命令。"""
+    return "'" + str(text).replace("'", "''") + "'"
+
+
 class WorkProgressWindow:
     """单个作品的进度窗口。"""
 
@@ -34,6 +40,8 @@ class WorkProgressWindow:
         self._file = progress_dir / f'{_safe_name(label)}_{abs(hash(work_key)) & 0xFFFFFF:x}.txt'
         self._proc: subprocess.Popen | None = None
         self._closed = False
+        # 同一作品的多个音轨可能并行翻译，进度写入需要串行化，避免行内容交错
+        self._write_lock = threading.Lock()
 
     def open(self) -> None:
         if not _IS_WINDOWS:
@@ -44,14 +52,15 @@ class WorkProgressWindow:
                 f.write(f'HDEG 翻译 - {self.label}\n')
                 f.write('-' * 40 + '\n')
             script = (
-                f"$Host.UI.RawUI.WindowTitle = 'HDEG 翻译 - {self.label}'; "
-                f"Get-Content -LiteralPath '{self._file}' -Encoding UTF8 -Wait"
+                f"$Host.UI.RawUI.WindowTitle = {_ps_quote(f'HDEG 翻译 - {self.label}')}; "
+                f"Get-Content -LiteralPath {_ps_quote(str(self._file))} -Encoding UTF8 -Wait"
             )
             self._proc = subprocess.Popen(
                 ['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass',
                  '-WindowStyle', 'Minimized', '-Command', script],
                 creationflags=getattr(subprocess, 'CREATE_NEW_CONSOLE', 0),
-                stdout=subprocess.DEVNULL,
+                # 不能重定向 stdout：新控制台的 Get-Content 输出走 stdout，
+                # DEVNULL 会让窗口一片空白（只能看到标题）。
                 stderr=subprocess.DEVNULL,
             )
         except Exception:
@@ -62,8 +71,11 @@ class WorkProgressWindow:
         if self._closed:
             return
         try:
-            with open(self._file, 'a', encoding='utf-8') as f:
-                f.write(str(line).rstrip('\n') + '\n')
+            with self._write_lock:
+                if self._closed:
+                    return
+                with open(self._file, 'a', encoding='utf-8') as f:
+                    f.write(str(line).rstrip('\n') + '\n')
         except OSError:
             pass
 

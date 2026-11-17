@@ -13,12 +13,12 @@
   "meta": {
     "record_type": "retrospective",
     "recorded_on": "2026-11-10",
-    "implementation_period": "2026-10-30 至 2026-11-10（依据会话与提交记录）",
+    "implementation_period": "2026-10-30 至 2026-11-17（依据会话与提交记录）",
     "repository": "https://github.com/hz121315/HDEG",
     "trellis_initialized": false,
-    "status_reason": "核心改造与 2026-11-10 至 17 的追加能力已完成并有自动化测试覆盖；但仍缺真实音频/API 端到端验收及 001 原始缺口（进度窗、流式日志、重试源路径等），不能标为 completed。",
+    "status_reason": "核心改造与 2026-11-10 至 17 的追加能力已完成并有自动化测试覆盖；2026-11-17 续开发及复核补修已补齐流式重试源路径、最终失败收尾、skipped 去重、同名轨日志隔离、跨作品状态隔离与块级进度回调。仍缺真实音频/API 端到端验收及部分 001 原始缺口（归档边界、多根入口契约等），不能标为 completed。",
     "latest_verified_baseline": "46d709c7",
-    "verification": "2026-11-17：离线全量 133 passed、1 deselected；frozen exe 冒烟与发布配置校验通过。未做真实 GPU 转录、真实计费 API 或完整端到端验收。",
+    "verification": "2026-11-17 续开发及复核补修：离线全量 145 passed、1 deselected（tests/test_stream_retry_stats.py 12 项）；frozen exe 冒烟与发布配置校验为上一轮结果。未做真实 GPU 转录、真实计费 API、真实 Windows 进度窗或完整端到端验收。",
     "artifacts": [
       "README.md",
       "prd.md",
