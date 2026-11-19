@@ -1,0 +1,29 @@
+{
+  "id": "001-ds",
+  "name": "001-ds",
+  "title": "以 Agent Skill 形式接入 harness-only 模型的 LRC 翻译（可行性评估）",
+  "status": "planning",
+  "priority": "P2",
+  "branch": "main",
+  "base_branch": "main",
+  "parent": null,
+  "children": [],
+  "commit": "bee85b94",
+  "pr_url": null,
+  "meta": {
+    "record_type": "assessment",
+    "recorded_on": "2026-11-18",
+    "repository": "https://github.com/hz121315/HDEG",
+    "trellis_initialized": false,
+    "status_reason": "仅完成可行性与方案评估，未实现 skill、未修改项目代码。等待用户确认主用 harness、状态目录位置、台本范围后进入 P1。",
+    "verdict": "可行。skill + 项目内复用脚本是正确形态；不推荐把 Antigravity 订阅包装成 HDEG engine。",
+    "verification": "离线验证 prompt 构建、LRC 回写、orchestrator 导入均可用；未在 harness 内实测，未验证成人向内容接受度。",
+    "artifacts": [
+      "README.md",
+      "prd.md",
+      "design.md",
+      "implement.md",
+      "verification.md"
+    ]
+  }
+}

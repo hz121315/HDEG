@@ -190,3 +190,10 @@ __pycache__/
 temp/
 # 本地发布副本（不随仓库分发；main.exe 约 117MB，超过 GitHub 单文件上限）
 release/
+
+# ==================== Agent Skill 分发 ====================
+# 技能需要提交 SKILL.md、config.json 和 references，覆盖上面的通用 Markdown/JSON 忽略规则。
+!skills/
+!skills/**
+skills/**/.runtime/
+

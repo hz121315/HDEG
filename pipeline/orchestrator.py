@@ -654,15 +654,15 @@ class PipelineContext:
 
         # ── NSFW 多级降级重试 ──
         # 翻译因道德审查返回空白/拒绝时，逐级更换上下文重试：
-        #   第1级 完整上下文 → 第2级 和谐版世界观 → 第3级 仅和谐版角色表+术语 → 第4级 纯文本裸翻 → 跳过
+        #   第1级 完整上下文 → 第2级 脱敏版世界观 → 第3级 仅脱敏版角色表+术语 → 第4级 纯文本裸翻 → 跳过
         # 关闭时保持旧行为：失败音轨进入轮级重试队列（translate_failed_max_retries）。
         self.nsfw_fallback_enabled = bool(self.app_cfg.get('nsfw_fallback_enabled', True))
-        # 和谐化/世界观分析专用引擎缓存（api.harmonize / api.worldview 非空时独立于翻译引擎；懒加载）
-        self._harmonize_engine = None
+        # 脱敏/世界观分析专用引擎缓存（api.desensitize / api.worldview 非空时独立于翻译引擎；懒加载）
+        self._desensitize_engine = None
         self._worldview_engine = None
-        # 按 RJ 组（wkey）的和谐版生成锁：防止同组多音轨并发重复生成
-        self._harmonize_locks: dict = {}
-        self._harmonize_locks_guard = threading.Lock()
+        # 按 RJ 组（wkey）的脱敏版生成锁：防止同组多音轨并发重复生成
+        self._desensitize_locks: dict = {}
+        self._desensitize_locks_guard = threading.Lock()
 
         # RJ 号向上查找层数（进程级，供 find_rj_work_root 的默认值使用）
         from io_adapter.file_scanner import set_rj_lookup_depth
@@ -2264,9 +2264,9 @@ def _enqueue_failed_track(ctx: PipelineContext, task: dict, reason: str) -> None
 # ==================== NSFW 多级降级重试辅助 ====================
 
 def _get_context_engine(ctx: PipelineContext, sub_key: str, cache_attr: str, tag: str):
-    """获取指定用途的 LLM 引擎（懒加载，线程安全，harmonize/worldview 通用）。
+    """获取指定用途的 LLM 引擎（懒加载，线程安全，desensitize/worldview 通用）。
 
-    config api.<sub_key>（如 api.harmonize / api.worldview）支持覆盖：
+    config api.<sub_key>（如 api.desensitize / api.worldview）支持覆盖：
       - key / base_url / model / protocol：独立端点与模型
       - generation_params：按用途覆盖全局生成参数（reasoning_effort、temperature、
         top_p、max_tokens、max_retries 等），未列出的项继承全局
@@ -2277,7 +2277,10 @@ def _get_context_engine(ctx: PipelineContext, sub_key: str, cache_attr: str, tag
         _cached = getattr(ctx, cache_attr, None)
         if _cached is not None:
             return _cached
-        h_cfg = (ctx.config.get('api', {}) or {}).get(sub_key) or {}
+        api_cfg = ctx.config.get('api', {}) or {}
+        h_cfg = api_cfg.get(sub_key) if sub_key in api_cfg else (
+            api_cfg.get('harmonize') if sub_key == 'desensitize' else None)
+        h_cfg = h_cfg or {}
         if not isinstance(h_cfg, dict):
             h_cfg = {}
         _sub_gen = h_cfg.get('generation_params')
@@ -2318,9 +2321,9 @@ def _get_context_engine(ctx: PipelineContext, sub_key: str, cache_attr: str, tag
         return _engine
 
 
-def _get_harmonize_engine(ctx: PipelineContext):
-    """获取世界观和谐化专用引擎（api.harmonize，空则复用翻译引擎）。"""
-    return _get_context_engine(ctx, 'harmonize', '_harmonize_engine', '和谐')
+def _get_desensitize_engine(ctx: PipelineContext):
+    """获取世界观脱敏专用引擎（api.desensitize，空则复用翻译引擎）。"""
+    return _get_context_engine(ctx, 'desensitize', '_desensitize_engine', '脱敏')
 
 
 def _get_worldview_engine(ctx: PipelineContext):
@@ -2331,11 +2334,14 @@ def _get_worldview_engine(ctx: PipelineContext):
 def _load_rules_prompt(ctx: PipelineContext, config_key: str, tag: str) -> str | None:
     """读取用户自定义的规则 prompt 文件（UTF-8 文本）。
 
-    用途（worldview=世界观分析规则 / harmonize=和谐化改写规则）：
+    用途（worldview=世界观分析规则 / desensitize=脱敏改写规则）：
     文件内容**替换**对应内置 prompt 的规则部分；内置【输出要求】始终保留。
     文件不存在/为空/读取失败时返回 None（回退纯内置规则），容错先例同 prompts.system_prompt_file。
     """
-    _p_file = (ctx.config.get('prompts', {}) or {}).get(config_key, '')
+    prompts = ctx.config.get('prompts', {}) or {}
+    _p_file = prompts.get(config_key) if config_key in prompts else (
+        prompts.get('harmonize_system_prompt_file')
+        if config_key == 'desensitize_system_prompt_file' else '')
     if not _p_file:
         return None
     try:
@@ -2354,59 +2360,57 @@ def _load_rules_prompt(ctx: PipelineContext, config_key: str, tag: str) -> str |
         return None
 
 
-def _load_harmonize_prompt(ctx: PipelineContext) -> str | None:
-    """读取和谐化自定义规则 prompt（prompts.harmonize_system_prompt_file）。"""
-    return _load_rules_prompt(ctx, 'harmonize_system_prompt_file', '和谐')
+def _load_desensitize_prompt(ctx: PipelineContext) -> str | None:
+    """读取脱敏自定义规则 prompt（prompts.desensitize_system_prompt_file）。"""
+    return _load_rules_prompt(ctx, 'desensitize_system_prompt_file', '脱敏')
 
 
-def _ensure_harmonized_worldview(ctx: PipelineContext, wkey: str, worldview: dict,
+def _ensure_desensitized_worldview(ctx: PipelineContext, wkey: str, worldview: dict,
                                  label: str = '') -> dict | None:
-    """获取（不存在则生成）当前作品组的和谐版世界观。
+    """获取（不存在则生成）当前作品组的脱敏版世界观。
 
-    - 和谐版文件已存在（同组其他音轨生成过）→ 直接读取复用，不重新生成；
-    - 无原始世界观可和谐 → 返回 None（调用方直接跳过依赖和谐版的降级级别）；
-    - 生成走 LLM（api.harmonize 可配独立 API），per-wkey 锁 + 双重检查防止
+    - 脱敏版文件已存在（同组其他音轨生成过）→ 直接读取复用，不重新生成；
+    - 无原始世界观可脱敏 → 返回 None（调用方直接跳过依赖脱敏版的降级级别）；
+    - 生成走 LLM（api.desensitize 可配独立 API），per-wkey 锁 + 双重检查防止
       同组多音轨并发翻译时重复生成。
     失败（API 拒绝/解析失败）同样返回 None。
     """
     from engines.worldview_engine import (
-        get_harmonized_worldview_path, load_harmonized_worldview,
-        save_harmonized_worldview, harmonize_worldview_with_llm,
+        get_desensitized_worldview_path, load_desensitized_worldview,
+        save_desensitized_worldview, desensitize_worldview_with_llm,
     )
     work_dir = Path(wkey)
-    hpath = get_harmonized_worldview_path(work_dir)
+    hpath = get_desensitized_worldview_path(work_dir)
 
-    # 快路径：已有和谐版文件
-    if hpath.exists():
-        cached = load_harmonized_worldview(work_dir)
-        if cached:
-            _log(f"  [和谐] 复用已有和谐版世界观: {hpath.name}")
-            return cached
+    # 加载器兼容旧缓存文件名；新文件存在时绝不回退旧文件。
+    cached = load_desensitized_worldview(work_dir)
+    if cached:
+        _log(f"  [脱敏] 复用已有脱敏版世界观: {work_dir.name}")
+        return cached
 
     if not worldview:
         return None
 
     # 懒加载 per-wkey 锁，锁内双重检查
-    with ctx._harmonize_locks_guard:
-        _lock = ctx._harmonize_locks.get(wkey)
+    with ctx._desensitize_locks_guard:
+        _lock = ctx._desensitize_locks.get(wkey)
         if _lock is None:
             _lock = threading.Lock()
-            ctx._harmonize_locks[wkey] = _lock
+            ctx._desensitize_locks[wkey] = _lock
     with _lock:
-        if hpath.exists():
-            cached = load_harmonized_worldview(work_dir)
-            if cached:
-                return cached
-        _log(f"  [和谐] 首次生成和谐版世界观（{label or work_dir.name}）", console=True)
+        cached = load_desensitized_worldview(work_dir)
+        if cached:
+            return cached
+        _log(f"  [脱敏] 首次生成脱敏版世界观（{label or work_dir.name}）", console=True)
         try:
-            engine = _get_harmonize_engine(ctx)
-            harmonized, h_token_stats = harmonize_worldview_with_llm(
+            engine = _get_desensitize_engine(ctx)
+            desensitized, h_token_stats = desensitize_worldview_with_llm(
                 engine, worldview, verbose=ctx.pr.debug_enabled,
-                extra_system_prompt=_load_harmonize_prompt(ctx))
+                extra_system_prompt=_load_desensitize_prompt(ctx))
         except Exception as e:
-            _log(f"  [和谐] 世界观和谐化异常: {e}", console=True)
-            harmonized, h_token_stats = None, {
-                'failure_info': {'reason': f'和谐化异常: {e}', 'raw': '',
+            _log(f"  [脱敏] 世界观脱敏异常: {e}", console=True)
+            desensitized, h_token_stats = None, {
+                'failure_info': {'reason': f'脱敏异常: {e}', 'raw': '',
                                  'request_diagnostics': getattr(e, 'request_diagnostics', [])}}
         # token 统计（无论成败都记，费用已实际发生）
         if any(k in h_token_stats for k in ('prompt_tokens', 'hit_tokens', 'completion_tokens')):
@@ -2417,7 +2421,7 @@ def _ensure_harmonized_worldview(ctx: PipelineContext, wkey: str, worldview: dic
             )
             with ctx.thread_lock:
                 ctx.tracker.record(TokenUsage(
-                    request_type='harmonize',
+                    request_type='desensitize',
                     label=f'{work_dir.name} 世界观',
                     work_key=str(work_dir),
                     prompt_tokens=h_token_stats.get('prompt_tokens', 0),
@@ -2429,16 +2433,16 @@ def _ensure_harmonized_worldview(ctx: PipelineContext, wkey: str, worldview: dic
                     elapsed=0,
                 ))
                 ctx.pr.token_inline(ctx.tracker.records[-1])
-        if harmonized:
-            save_harmonized_worldview(work_dir, harmonized)
-            _chars = harmonized.get('characters', [])
+        if desensitized:
+            save_desensitized_worldview(work_dir, desensitized)
+            _chars = desensitized.get('characters', [])
             _char_n = len(_chars) if isinstance(_chars, (list, dict)) else 0
-            _log(f"  [和谐] 和谐版世界观已保存: {hpath.name}（{_char_n} 个角色）")
-            return harmonized
+            _log(f"  [脱敏] 脱敏版世界观已保存: {hpath.name}（{_char_n} 个角色）")
+            return desensitized
         _write_worldview_failure_log(work_dir, h_token_stats.get('failure_info') or {
-            'reason': '和谐化未产出有效世界观', 'raw': '',
-            'request_diagnostics': h_token_stats.get('request_diagnostics', [])}, purpose='harmonize')
-        _log(f"  [和谐] 世界观和谐化失败，跳过依赖和谐版的降级级别", console=True)
+            'reason': '脱敏未产出有效世界观', 'raw': '',
+            'request_diagnostics': h_token_stats.get('request_diagnostics', [])}, purpose='desensitize')
+        _log(f"  [脱敏] 世界观脱敏失败，跳过依赖脱敏版的降级级别", console=True)
         return None
 
 
@@ -2468,7 +2472,7 @@ def _write_translate_failure_log(lrc_path: Path, ctx: PipelineContext,
                                  attempt_desc: str, reason: str,
                                  raw_excerpt: str = '',
                                  request_diagnostics: list | None = None) -> None:
-    """翻译（或和谐化）请求失败时，向音频所在目录 log/<音频同名>.log 追加一条记录。
+    """翻译（或脱敏）请求失败时，向音频所在目录 log/<音频同名>.log 追加一条记录。
 
     同一音频多次失败记录在同一文件中，每条带时间戳与请求序号分隔。
     日志写入失败只提示，不影响翻译主流程。
@@ -2493,7 +2497,7 @@ def _write_translate_failure_log(lrc_path: Path, ctx: PipelineContext,
 
 def _write_worldview_failure_log(work_dir: Path, fail_info: dict,
                                  purpose: str = 'worldview') -> None:
-    """世界观分析/和谐化失败：追加到作品根 log/worldview.log 或 log/harmonize.log。
+    """世界观分析/脱敏失败：追加到作品根 log/worldview.log 或 log/desensitize.log。
 
     多次失败记录在同一文件（含时间戳分隔），记录原因与 API 原始返回
     （拒答时通常是拒绝话术）。写入失败只提示，不影响主流程。
@@ -2501,8 +2505,9 @@ def _write_worldview_failure_log(work_dir: Path, fail_info: dict,
     try:
         log_dir = Path(work_dir) / 'log'
         log_dir.mkdir(parents=True, exist_ok=True)
-        log_file = log_dir / ('harmonize.log' if purpose == 'harmonize' else 'worldview.log')
-        _tag = '世界观和谐化' if purpose == 'harmonize' else '世界观生成'
+        is_desensitize = purpose in ('desensitize', 'harmonize')  # 兼容旧调用方用途标识。
+        log_file = log_dir / ('desensitize.log' if is_desensitize else 'worldview.log')
+        _tag = '世界观脱敏' if is_desensitize else '世界观生成'
         _ts = time.strftime('%Y-%m-%d %H:%M:%S')
         parts = [f"\n{'═' * 56}",
                  f"[{_ts}] {_tag}失败（{Path(work_dir).name}）",
@@ -2689,8 +2694,8 @@ def translate_one_lrc(
     # 单音轨内以整轨为单位逐级更换上下文重试，块级快速失败（任一整块解析失败
     # 即终止本级，不浪费后续块请求）：
     #   第1级 完整上下文（世界观+角色+术语，与旧行为一致）
-    #   第2级 和谐版世界观+角色表（LLM 改写高危设定；术语/alias 保留原版）
-    #   第3级 无世界观，仅和谐版角色表+术语
+    #   第2级 脱敏版世界观+角色表（LLM 改写高危设定；术语/alias 保留原版）
+    #   第3级 无世界观，仅脱敏版角色表+术语
     #   第4级 纯文本裸翻（不带任何术语/角色/世界观）
     # 任一级成功即写文件；第4级仍失败则跳过该音轨（不再入轮级重试队列）。
     # app.nsfw_fallback_enabled=false 时仅第1级，失败走旧逻辑进入轮级重试队列。
@@ -2808,13 +2813,13 @@ def translate_one_lrc(
             'elapsed': _p_elapsed, 'fr_list': _p_fr, 'reason_preview': _p_reason_preview,
         }
 
-    # RJ 作品根（token 统计与和谐版文件归属使用）
+    # RJ 作品根（token 统计与脱敏版文件归属使用）
     _rj_root, _ = find_rj_work_root(lrc_path)
     _work_key = str(_rj_root) if _rj_root else str(lrc_path.parent)
     _wkey_eff = wkey or _work_key
 
-    _harmonized = None        # 和谐版世界观（第1级失败后生成/读取）
-    _harmonized_tried = False
+    _desensitized = None        # 脱敏版世界观（第1级失败后生成/读取）
+    _desensitized_tried = False
     _max_levels = 4 if _fallback_on else 1
     _pass_res = None
     _eff_terms, _eff_alias, _eff_worldview = terms, alias_list, worldview
@@ -2825,17 +2830,17 @@ def translate_one_lrc(
             _lv_desc = '第1次请求(完整上下文: 世界观+角色+术语)'
             _pt, _pa, _pw = terms, alias_list, worldview
         elif _lv in (2, 3):
-            # 第2/3级依赖和谐版世界观；生成失败或无原始世界观时跳过
-            if _harmonized is None:
+            # 第2/3级依赖脱敏版世界观；生成失败或无原始世界观时跳过
+            if _desensitized is None:
                 continue
             if _lv == 2:
-                _lv_desc = '第2次请求(和谐版世界观+角色表, 术语保留)'
-                _pt, _pa, _pw = terms, alias_list, _harmonized
+                _lv_desc = '第2次请求(脱敏版世界观+角色表, 术语保留)'
+                _pt, _pa, _pw = terms, alias_list, _desensitized
             else:
-                _h_chars = _harmonized.get('characters') if isinstance(_harmonized, dict) else None
+                _h_chars = _desensitized.get('characters') if isinstance(_desensitized, dict) else None
                 if not _h_chars:
                     continue
-                _lv_desc = '第3次请求(无世界观, 和谐版角色表+术语)'
+                _lv_desc = '第3次请求(无世界观, 脱敏版角色表+术语)'
                 _pt, _pa, _pw = terms, alias_list, {'characters': _h_chars}
         else:
             _lv_desc = '第4次请求(纯文本, 无任何附加上下文)'
@@ -2884,10 +2889,10 @@ def translate_one_lrc(
             _write_translate_failure_log(lrc_path, ctx, _lv_desc, _pass_res['reason'],
                                          _pass_res['raw'], _pass_res['request_diagnostics'])
 
-        # 第1级失败后首次触发和谐版生成（同组其他音轨已生成时直接复用文件）
-        if _lv == 1 and _fallback_on and not _harmonized_tried:
-            _harmonized_tried = True
-            _harmonized = _ensure_harmonized_worldview(ctx, _wkey_eff, worldview, label)
+        # 第1级失败后首次触发脱敏版生成（同组其他音轨已生成时直接复用文件）
+        if _lv == 1 and _fallback_on and not _desensitized_tried:
+            _desensitized_tried = True
+            _desensitized = _ensure_desensitized_worldview(ctx, _wkey_eff, worldview, label)
     else:
         # ── 全部级别失败 ──
         _final_reason = (_pass_res or {}).get('reason', '未知原因')
@@ -2947,7 +2952,7 @@ def translate_one_lrc(
 
     # 润色（Post-editing）：config app.polish_after_translate=true 时启用。
     # 只返回需要润色的行并写回，术语表/世界观一并发送以保护既定译名。
-    # 使用成功那一级降级的上下文（可能是和谐版/裸翻级）。
+    # 使用成功那一级降级的上下文（可能是脱敏版/裸翻级）。
     if ctx.config.get('app', {}).get('polish_after_translate', False):
         try:
             _polish_map = ctx.translate_engine.polish_batch(
@@ -3883,10 +3888,20 @@ def run_pipeline(
     sys.stdout.flush()
     sys.stderr.flush()
 
+    global _pr
     ctx = PipelineContext(config_path)
     _roots = [Path(r) for r in (root if isinstance(root, (list, tuple)) else [root])]
     root = _roots[0]
     root_abs = root.absolute()
+
+    # 准备模式独立分流：不经过翻译预检、流式派发或字幕翻译重试。
+    _prepare_only = ctx.app_cfg.get('prepare_only', False)
+    if type(_prepare_only) is not bool:
+        raise ValueError('app.prepare_only 必须是 JSON 布尔值 true/false')
+    if _prepare_only:
+        from pipeline.translation_prepare import run_prepare_only
+        _pr = ctx.pr
+        return run_prepare_only(_roots, ctx, progress_callback=progress_callback)
 
     # 多根目录：流式模式下共享同一线程池并发推进；非流式逐目录串行
     if len(_roots) > 1:
@@ -3899,7 +3914,6 @@ def run_pipeline(
         return _last
 
     # 设置模块级 printer，使 _debug() 可以工作
-    global _pr
     _pr = ctx.pr
 
     # 重置前置 worker ID 计数器

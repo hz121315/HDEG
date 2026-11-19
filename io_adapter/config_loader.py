@@ -52,6 +52,8 @@ def load_config(path: Path = None) -> dict[str, Any]:
     default_config = {
         "api": {"timeout": 2000, "protocol": "", "models": {}},
         "app": {
+            # 仅转录并准备供 Skill 消费的数据；默认关闭，保持原翻译流程。
+            "prepare_only": False,
             "translation_mode": "per_track",
             "translation_parallel": 10,
             "print_worker_detail": False,
@@ -75,8 +77,8 @@ def load_config(path: Path = None) -> dict[str, Any]:
             "srt_vtt_resync": True,
             "lrc_max_lines_per_request": 100,
             # ── NSFW 多级降级重试 ──
-            # 翻译被道德审查拦截（空白/拒绝）时逐级降级：完整上下文 → 和谐版世界观
-            # → 仅和谐版角色表 → 纯文本裸翻；仍失败则跳过该音轨
+            # 翻译被道德审查拦截（空白/拒绝）时逐级降级：完整上下文 → 脱敏版世界观
+            # → 仅脱敏版角色表 → 纯文本裸翻；仍失败则跳过该音轨
             "nsfw_fallback_enabled": True,
         },
         "pricing": {"hit_per_1m": 0.02, "miss_per_1m": 1, "completion_per_1m": 2},
@@ -112,8 +114,23 @@ def load_config(path: Path = None) -> dict[str, Any]:
 
     # 环境变量覆盖（CI / 命令行注入凭证用）：优先级高于 config.json
     _apply_env_overrides(config)
+    _apply_desensitize_aliases(config)
 
     return config
+
+
+def _apply_desensitize_aliases(config: dict) -> None:
+    """旧字段仅在新字段缺失时映射；不写回用户配置、不合并两个用途端点。"""
+    import copy
+
+    api = config.get('api')
+    if isinstance(api, dict) and 'desensitize' not in api and 'harmonize' in api:
+        api['desensitize'] = copy.deepcopy(api['harmonize'])
+    prompts = config.get('prompts')
+    if (isinstance(prompts, dict) and 'desensitize_system_prompt_file' not in prompts
+            and 'harmonize_system_prompt_file' in prompts):
+        prompts['desensitize_system_prompt_file'] = prompts['harmonize_system_prompt_file']
+
 
 
 def _is_empty_value(v) -> bool:

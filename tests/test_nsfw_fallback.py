@@ -3,13 +3,13 @@
 
 覆盖：
 - 第1级成功（旧行为不变）
-- 第1级拒答 → 复用/生成和谐版世界观 → 第2级成功
+- 第1级拒答 → 复用/生成脱敏版世界观 → 第2级成功
 - 4 级全部失败 → 跳过音轨（不入轮级重试队列）+ 失败日志 4 条
 - 开关关闭 → 失败仅 1 次调用，走旧轮级重试队列
 - 无世界观 → 直接从第1级降到第4级裸翻
 - 翻译全空（parsed_count>0 但全空串）同样触发降级
-- harmonize_worldview_with_llm 单元（JSON 改写 / _source 剥离 / 拒答返回 None）
-- 和谐版文件生成后同组复用（不重复调用 LLM）
+- desensitize_worldview_with_llm 单元（JSON 改写 / _source 剥离 / 拒答返回 None）
+- 脱敏版文件生成后同组复用（不重复调用 LLM）
 """
 
 from __future__ import annotations
@@ -116,9 +116,9 @@ def make_ctx(engine, *, nsfw_fallback_enabled=True, config_app=None):
         translate_engine=engine,
         max_failed_retries=3,
         nsfw_fallback_enabled=nsfw_fallback_enabled,
-        _harmonize_engine=None,
-        _harmonize_locks={},
-        _harmonize_locks_guard=threading.Lock(),
+        _desensitize_engine=None,
+        _desensitize_locks={},
+        _desensitize_locks_guard=threading.Lock(),
         retry_queue=[],
         retry_results={},
         abnormal_count=0,
@@ -144,7 +144,7 @@ ORIG_WV = {
     'special_terms': {'テスト': '测试'},
 }
 
-HARMONIZED_WV = {
+DESENSITIZED_WV = {
     'worldview': '关系亲密的两人之间的故事。',
     'characters': [
         {'name': 'お父さん', 'name_cn': '伴侣', 'role': '同居人', 'personality': '温柔',
@@ -185,21 +185,21 @@ def test_level0_success(tmp_path):
     assert ctx.stats['skipped'] == 0
 
 
-def test_refuse_then_harmonized_file_success(tmp_path):
-    """第1级拒答 → 读取已有和谐版文件 → 第2级成功，日志记录第1次失败。"""
+def test_refuse_then_desensitized_file_success(tmp_path):
+    """第1级拒答 → 读取已有脱敏版文件 → 第2级成功，日志记录第1次失败。"""
     work = tmp_path / 'RJ01000002'
     work.mkdir()
-    # 预置同组其他音轨生成的和谐版文件
-    (work / '和谐版.worldview.json').write_text(
-        json.dumps(HARMONIZED_WV, ensure_ascii=False), encoding='utf-8')
+    # 预置同组其他音轨生成的脱敏版文件
+    (work / '脱敏版.worldview.json').write_text(
+        json.dumps(DESENSITIZED_WV, ensure_ascii=False), encoding='utf-8')
 
     engine = FakeEngine([{'refuse': True}, {}])
     ctx = make_ctx(engine)
     ok, target = run_translate(ctx, work, worldview=dict(ORIG_WV))
     assert ok is True
     assert len(engine.calls) == 2
-    # 第2次请求带的是和谐版世界观
-    assert engine.calls[1]['worldview'] == HARMONIZED_WV
+    # 第2次请求带的是脱敏版世界观
+    assert engine.calls[1]['worldview'] == DESENSITIZED_WV
     assert target.exists()
     assert ctx.stats['skipped'] == 0
     assert ctx.retry_queue == []
@@ -216,8 +216,8 @@ def test_all_levels_fail_skip(tmp_path):
     """4 级全部失败 → 跳过音轨，不入轮级重试队列，日志含 4 条记录。"""
     work = tmp_path / 'RJ01000003'
     work.mkdir()
-    (work / '和谐版.worldview.json').write_text(
-        json.dumps(HARMONIZED_WV, ensure_ascii=False), encoding='utf-8')
+    (work / '脱敏版.worldview.json').write_text(
+        json.dumps(DESENSITIZED_WV, ensure_ascii=False), encoding='utf-8')
 
     engine = FakeEngine([{'refuse': True}] * 4)
     ctx = make_ctx(engine)
@@ -227,8 +227,8 @@ def test_all_levels_fail_skip(tmp_path):
     assert len(engine.calls) == 4
     # 级别上下文断言
     assert engine.calls[0]['worldview'] == ORIG_WV          # L1 完整
-    assert engine.calls[1]['worldview'] == HARMONIZED_WV    # L2 和谐版世界观
-    assert engine.calls[2]['worldview'] == {'characters': HARMONIZED_WV['characters']}  # L3 无世界观
+    assert engine.calls[1]['worldview'] == DESENSITIZED_WV    # L2 脱敏版世界观
+    assert engine.calls[2]['worldview'] == {'characters': DESENSITIZED_WV['characters']}  # L3 无世界观
     assert engine.calls[3]['worldview'] is None             # L4 裸翻
     assert engine.calls[3]['terms'] is None
     assert engine.calls[3]['alias_list'] is None
@@ -264,7 +264,7 @@ def test_fallback_disabled_keeps_old_behavior(tmp_path):
 
 
 def test_no_worldview_drops_to_level4(tmp_path):
-    """无世界观可和谐：第2/3级跳过，第2次调用即第4级裸翻。"""
+    """无世界观可脱敏：第2/3级跳过，第2次调用即第4级裸翻。"""
     work = tmp_path / 'RJ01000005'
     work.mkdir()
     engine = FakeEngine([{'refuse': True}, {}])
@@ -281,8 +281,8 @@ def test_empty_translation_triggers_fallback(tmp_path):
     """翻译全空（parsed_count>0 但全部空串）同样触发降级。"""
     work = tmp_path / 'RJ01000006'
     work.mkdir()
-    (work / '和谐版.worldview.json').write_text(
-        json.dumps(HARMONIZED_WV, ensure_ascii=False), encoding='utf-8')
+    (work / '脱敏版.worldview.json').write_text(
+        json.dumps(DESENSITIZED_WV, ensure_ascii=False), encoding='utf-8')
     engine = FakeEngine([{'empty': True}, {}])
     ctx = make_ctx(engine)
     ok, target = run_translate(ctx, work, worldview=dict(ORIG_WV))
@@ -297,8 +297,8 @@ def test_api_exception_triggers_fallback(tmp_path):
     """API 异常（报错拒绝）同样触发降级并记录异常文本。"""
     work = tmp_path / 'RJ01000007'
     work.mkdir()
-    (work / '和谐版.worldview.json').write_text(
-        json.dumps(HARMONIZED_WV, ensure_ascii=False), encoding='utf-8')
+    (work / '脱敏版.worldview.json').write_text(
+        json.dumps(DESENSITIZED_WV, ensure_ascii=False), encoding='utf-8')
     engine = FakeEngine([{'raise': 'API 调用失败：content policy violation'}, {}])
     ctx = make_ctx(engine)
     ok, target = run_translate(ctx, work, worldview=dict(ORIG_WV))
@@ -308,7 +308,7 @@ def test_api_exception_triggers_fallback(tmp_path):
     assert 'content policy violation' in content
 
 
-# ==================== 和谐化 LLM 单元 ====================
+# ==================== 脱敏 LLM 单元 ====================
 
 class FakeCallApiEngine:
     def __init__(self, reply, stats=None, config=None):
@@ -327,14 +327,14 @@ class FakeCallApiEngine:
         return self.reply, self.stats
 
 
-def test_harmonize_worldview_with_llm_ok():
-    from engines.worldview_engine import harmonize_worldview_with_llm
+def test_desensitize_worldview_with_llm_ok():
+    from engines.worldview_engine import desensitize_worldview_with_llm
     wv = dict(ORIG_WV)
     wv['_source'] = ['内部元数据.json']
-    reply = json.dumps(HARMONIZED_WV, ensure_ascii=False)
+    reply = json.dumps(DESENSITIZED_WV, ensure_ascii=False)
     eng = FakeCallApiEngine(reply)
-    result, stats = harmonize_worldview_with_llm(eng, wv)
-    assert result == HARMONIZED_WV
+    result, stats = desensitize_worldview_with_llm(eng, wv)
+    assert result == DESENSITIZED_WV
     assert stats['prompt_tokens'] == 5
     # _source 不发送给 LLM
     sys_p, user_p = eng.prompts[0]
@@ -343,68 +343,68 @@ def test_harmonize_worldview_with_llm_ok():
     assert '合规' in sys_p
 
 
-def test_harmonize_worldview_with_llm_refuse():
-    from engines.worldview_engine import harmonize_worldview_with_llm
+def test_desensitize_worldview_with_llm_refuse():
+    from engines.worldview_engine import desensitize_worldview_with_llm
     eng = FakeCallApiEngine('我很抱歉，但我无法处理这个请求。')
-    result, stats = harmonize_worldview_with_llm(eng, dict(ORIG_WV))
+    result, stats = desensitize_worldview_with_llm(eng, dict(ORIG_WV))
     assert result is None
 
     eng2 = FakeCallApiEngine(RuntimeError('API 调用失败：403'))
-    result2, _ = harmonize_worldview_with_llm(eng2, dict(ORIG_WV))
+    result2, _ = desensitize_worldview_with_llm(eng2, dict(ORIG_WV))
     assert result2 is None
 
 
-def test_harmonize_extra_system_prompt_prepended():
+def test_desensitize_extra_system_prompt_prepended():
     """自定义规则 prompt **替换**内置规则，内置【输出要求】仍保留在后。"""
     from engines.worldview_engine import (
-        HARMONIZE_SYSTEM_PROMPT, HARMONIZE_RULES_PROMPT,
-        HARMONIZE_OUTPUT_REQUIREMENTS, harmonize_worldview_with_llm,
+        DESENSITIZE_SYSTEM_PROMPT, DESENSITIZE_RULES_PROMPT,
+        DESENSITIZE_OUTPUT_REQUIREMENTS, desensitize_worldview_with_llm,
     )
     # 兼容常量：完整内置 = 规则 + 输出要求
-    assert HARMONIZE_SYSTEM_PROMPT == HARMONIZE_RULES_PROMPT + HARMONIZE_OUTPUT_REQUIREMENTS
+    assert DESENSITIZE_SYSTEM_PROMPT == DESENSITIZE_RULES_PROMPT + DESENSITIZE_OUTPUT_REQUIREMENTS
     extra = '血腥、肢解、酷刑等描写一律改写为"激烈冲突"等温和表述。'
-    eng = FakeCallApiEngine(json.dumps(HARMONIZED_WV, ensure_ascii=False))
-    result, _ = harmonize_worldview_with_llm(eng, dict(ORIG_WV),
+    eng = FakeCallApiEngine(json.dumps(DESENSITIZED_WV, ensure_ascii=False))
+    result, _ = desensitize_worldview_with_llm(eng, dict(ORIG_WV),
                                              extra_system_prompt=extra)
-    assert result == HARMONIZED_WV
+    assert result == DESENSITIZED_WV
     sys_p, _ = eng.prompts[0]
     assert sys_p.startswith(extra)                          # 自定义规则在前
-    assert HARMONIZE_OUTPUT_REQUIREMENTS in sys_p           # 内置输出要求保留在后
-    assert HARMONIZE_RULES_PROMPT not in sys_p              # 内置规则被替换
+    assert DESENSITIZE_OUTPUT_REQUIREMENTS in sys_p           # 内置输出要求保留在后
+    assert DESENSITIZE_RULES_PROMPT not in sys_p              # 内置规则被替换
     # 空白自定义 → 纯内置（规则+输出要求）
-    eng2 = FakeCallApiEngine(json.dumps(HARMONIZED_WV, ensure_ascii=False))
-    harmonize_worldview_with_llm(eng2, dict(ORIG_WV), extra_system_prompt='   ')
-    assert eng2.prompts[0][0] == HARMONIZE_SYSTEM_PROMPT
+    eng2 = FakeCallApiEngine(json.dumps(DESENSITIZED_WV, ensure_ascii=False))
+    desensitize_worldview_with_llm(eng2, dict(ORIG_WV), extra_system_prompt='   ')
+    assert eng2.prompts[0][0] == DESENSITIZE_SYSTEM_PROMPT
 
 
-def test_load_harmonize_prompt(tmp_path):
-    """_load_harmonize_prompt：文件存在读内容，缺失/为空/未配置回退 None。"""
+def test_load_desensitize_prompt(tmp_path):
+    """_load_desensitize_prompt：文件存在读内容，缺失/为空/未配置回退 None。"""
     from pipeline import orchestrator as orch
 
     ctx = make_ctx(FakeEngine(None))
     # 未配置
-    assert orch._load_harmonize_prompt(ctx) is None
+    assert orch._load_desensitize_prompt(ctx) is None
 
     # 文件存在
-    pf = tmp_path / 'harmonize_prefix.txt'
+    pf = tmp_path / 'desensitize_prefix.txt'
     pf.write_text('补充规则：血腥描写改写为激烈冲突。', encoding='utf-8')
     ctx.config = {'app': ctx.config['app'], 'api': {},
-                  'prompts': {'harmonize_system_prompt_file': str(pf)}}
-    assert orch._load_harmonize_prompt(ctx) == '补充规则：血腥描写改写为激烈冲突。'
+                  'prompts': {'desensitize_system_prompt_file': str(pf)}}
+    assert orch._load_desensitize_prompt(ctx) == '补充规则：血腥描写改写为激烈冲突。'
 
     # 文件不存在
-    ctx.config['prompts']['harmonize_system_prompt_file'] = str(tmp_path / 'nope.txt')
-    assert orch._load_harmonize_prompt(ctx) is None
+    ctx.config['prompts']['desensitize_system_prompt_file'] = str(tmp_path / 'nope.txt')
+    assert orch._load_desensitize_prompt(ctx) is None
 
     # 空文件
     pf2 = tmp_path / 'empty.txt'
     pf2.write_text('   ', encoding='utf-8')
-    ctx.config['prompts']['harmonize_system_prompt_file'] = str(pf2)
-    assert orch._load_harmonize_prompt(ctx) is None
+    ctx.config['prompts']['desensitize_system_prompt_file'] = str(pf2)
+    assert orch._load_desensitize_prompt(ctx) is None
 
 
-def test_ensure_harmonized_generates_and_reuses(tmp_path, monkeypatch):
-    """和谐版不存在时通过 LLM 生成并落盘；同组第二次失败直接复用文件。"""
+def test_ensure_desensitized_generates_and_reuses(tmp_path, monkeypatch):
+    """脱敏版不存在时通过 LLM 生成并落盘；同组第二次失败直接复用文件。"""
     import engines.worldview_engine as wve
     from pipeline import orchestrator as orch
 
@@ -412,35 +412,35 @@ def test_ensure_harmonized_generates_and_reuses(tmp_path, monkeypatch):
     work.mkdir()
     gen_calls = []
 
-    def fake_harmonize(engine, worldview, verbose=False, extra_system_prompt=None):
+    def fake_desensitize(engine, worldview, verbose=False, extra_system_prompt=None):
         gen_calls.append(1)
-        return dict(HARMONIZED_WV), {'prompt_tokens': 1, 'hit_tokens': 1,
+        return dict(DESENSITIZED_WV), {'prompt_tokens': 1, 'hit_tokens': 1,
                                      'miss_tokens': 0, 'completion_tokens': 1}
 
-    monkeypatch.setattr(wve, 'harmonize_worldview_with_llm', fake_harmonize)
+    monkeypatch.setattr(wve, 'desensitize_worldview_with_llm', fake_desensitize)
 
     ctx = make_ctx(FakeEngine(None))
-    ctx._harmonize_engine = 'fake-engine'   # 跳过真实引擎构造
+    ctx._desensitize_engine = 'fake-engine'   # 跳过真实引擎构造
 
-    out1 = orch._ensure_harmonized_worldview(ctx, str(work), dict(ORIG_WV), '测试')
-    assert out1 == HARMONIZED_WV
+    out1 = orch._ensure_desensitized_worldview(ctx, str(work), dict(ORIG_WV), '测试')
+    assert out1 == DESENSITIZED_WV
     assert len(gen_calls) == 1
-    assert (work / '和谐版.worldview.json').exists()
+    assert (work / '脱敏版.worldview.json').exists()
 
     # 第二次（同组其他音轨）：不重新生成
-    out2 = orch._ensure_harmonized_worldview(ctx, str(work), dict(ORIG_WV), '测试')
-    assert out2 == HARMONIZED_WV
+    out2 = orch._ensure_desensitized_worldview(ctx, str(work), dict(ORIG_WV), '测试')
+    assert out2 == DESENSITIZED_WV
     assert len(gen_calls) == 1
 
 
-def test_ensure_harmonized_no_worldview(tmp_path):
+def test_ensure_desensitized_no_worldview(tmp_path):
     """无原始世界观：直接返回 None，不生成文件。"""
     from pipeline import orchestrator as orch
     work = tmp_path / 'RJ01000009'
     work.mkdir()
     ctx = make_ctx(FakeEngine(None))
-    assert orch._ensure_harmonized_worldview(ctx, str(work), None, '测试') is None
-    assert not (work / '和谐版.worldview.json').exists()
+    assert orch._ensure_desensitized_worldview(ctx, str(work), None, '测试') is None
+    assert not (work / '脱敏版.worldview.json').exists()
 
 
 def test_worldview_analysis_prompt_split():
@@ -507,10 +507,13 @@ def test_get_worldview_engine_and_failure_log(tmp_path):
     assert 'API 调用异常' in content2
 
 
-def test_context_engine_merges_generation_params():
-    """api.worldview/harmonize 的 generation_params 覆盖全局，未列项继承；仅配参数也建独立引擎。"""
+def test_context_engine_merges_generation_params(monkeypatch):
+    """api.worldview/desensitize 的 generation_params 覆盖全局，未列项继承；仅配参数也建独立引擎。"""
+    from engines import translate_engine
     from pipeline import orchestrator as orch
 
+    monkeypatch.setattr(translate_engine, 'create_translate_engine',
+                        lambda config, **kwargs: SimpleNamespace(config=config))
     ctx = make_ctx(FakeEngine(None))
     ctx.config = {'app': {}, 'api': {
         'key': 'k', 'model': 'm', 'base_url': 'http://x',
@@ -526,27 +529,27 @@ def test_context_engine_merges_generation_params():
     assert eng.config['model'] == 'm'               # 端点继承全局
     assert eng._purpose_temp_locked is True         # 子段显式 temperature
 
-    # harmonize 子段与 worldview 相互独立
-    ctx.config['api']['harmonize'] = {'generation_params': {'reasoning_effort': 'max'}}
-    eng2 = orch._get_harmonize_engine(ctx)
+    # desensitize 子段与 worldview 相互独立
+    ctx.config['api']['desensitize'] = {'generation_params': {'reasoning_effort': 'max'}}
+    eng2 = orch._get_desensitize_engine(ctx)
     assert eng2.config['generation_params']['reasoning_effort'] == 'max'
     assert 'temperature' not in eng2.config['generation_params']
     assert eng2._purpose_temp_locked is False       # 未配置 temperature → 仍用 0.1
 
 
-def test_harmonize_temperature_respects_configured():
+def test_desensitize_temperature_respects_configured():
     """子段显式配置 temperature 时才不强制 0.1；全局 temperature 不放开默认。"""
-    from engines.worldview_engine import harmonize_worldview_with_llm
-    reply = json.dumps(HARMONIZED_WV, ensure_ascii=False)
+    from engines.worldview_engine import desensitize_worldview_with_llm
+    reply = json.dumps(DESENSITIZED_WV, ensure_ascii=False)
 
     eng = FakeCallApiEngine(reply)
     eng._purpose_temp_locked = True                 # 子段显式配置（引擎标记）
-    harmonize_worldview_with_llm(eng, dict(ORIG_WV))
+    desensitize_worldview_with_llm(eng, dict(ORIG_WV))
     assert eng.calls[0]['override_gen_params'] == {}
 
     # 全局配置 temperature（无子段）→ 仍强制默认 0.1
     eng2 = FakeCallApiEngine(reply, config={'generation_params': {'temperature': 0.3}})
-    harmonize_worldview_with_llm(eng2, dict(ORIG_WV))
+    desensitize_worldview_with_llm(eng2, dict(ORIG_WV))
     assert eng2.calls[0]['override_gen_params'] == {'temperature': 0.1}
 
 
@@ -567,28 +570,28 @@ def test_worldview_temperature_respects_configured():
 
 
 def test_load_rules_prompt_worldview(tmp_path):
-    """_load_rules_prompt 通用化：worldview 键独立于 harmonize 键。"""
+    """_load_rules_prompt 通用化：worldview 键独立于 desensitize 键。"""
     from pipeline import orchestrator as orch
     ctx = make_ctx(FakeEngine(None))
     pf = tmp_path / 'wv_rules.txt'
     pf.write_text('自定义世界观规则。', encoding='utf-8')
     ctx.config = {'app': ctx.config['app'], 'api': {},
                   'prompts': {'worldview_system_prompt_file': str(pf),
-                              'harmonize_system_prompt_file': ''}}
+                              'desensitize_system_prompt_file': ''}}
     assert orch._load_rules_prompt(ctx, 'worldview_system_prompt_file', '世界观') == '自定义世界观规则。'
-    # harmonize 键为空 → None（两键独立）
-    assert orch._load_rules_prompt(ctx, 'harmonize_system_prompt_file', '和谐') is None
+    # desensitize 键为空 → None（两键独立）
+    assert orch._load_rules_prompt(ctx, 'desensitize_system_prompt_file', '脱敏') is None
     # 旧封装函数仍可用
-    assert orch._load_harmonize_prompt(ctx) is None
+    assert orch._load_desensitize_prompt(ctx) is None
 
 
-def test_harmonize_file_paths(tmp_path):
+def test_desensitize_file_paths(tmp_path):
     from engines.worldview_engine import (
-        get_harmonized_worldview_path, load_harmonized_worldview,
-        save_harmonized_worldview,
+        get_desensitized_worldview_path, load_desensitized_worldview,
+        save_desensitized_worldview,
     )
-    p = get_harmonized_worldview_path(tmp_path)
-    assert p.name == '和谐版.worldview.json'
-    assert load_harmonized_worldview(tmp_path) == {}
-    save_harmonized_worldview(tmp_path, HARMONIZED_WV)
-    assert load_harmonized_worldview(tmp_path) == HARMONIZED_WV
+    p = get_desensitized_worldview_path(tmp_path)
+    assert p.name == '脱敏版.worldview.json'
+    assert load_desensitized_worldview(tmp_path) == {}
+    save_desensitized_worldview(tmp_path, DESENSITIZED_WV)
+    assert load_desensitized_worldview(tmp_path) == DESENSITIZED_WV

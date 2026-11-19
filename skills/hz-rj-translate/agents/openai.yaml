@@ -1,0 +1,4 @@
+interface:
+  display_name: "hz-RJ-translate"
+  short_description: "消费 HDEG 已准备的 RJ 字幕任务包，仅负责翻译、校验与写盘"
+  default_prompt: "使用 $hz-rj-translate 翻译指定 RJ 目录中 HDEG 已准备好的任务，保留固定上下文，不在 Agent 侧生成资料。"

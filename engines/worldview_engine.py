@@ -233,21 +233,26 @@ def save_worldview(work_dir: "Path", worldview: dict) -> None:
         json.dump(worldview, f, ensure_ascii=False, indent=2)
 
 
-# ==================== 和谐版世界观（NSFW 降级重试用） ====================
+# ==================== 脱敏版世界观（NSFW 降级重试用） ====================
 
-def get_harmonized_worldview_path(work_dir: "Path") -> "Path":
-    """获取和谐版世界观文件路径（与 .worldview.json 同目录，不覆盖原文件）"""
+def get_desensitized_worldview_path(work_dir: "Path") -> "Path":
+    """获取脱敏版世界观文件路径（与 .worldview.json 同目录，不覆盖原文件）"""
     from pathlib import Path
-    return Path(work_dir) / '和谐版.worldview.json'
+    return Path(work_dir) / '脱敏版.worldview.json'
 
 
-def load_harmonized_worldview(work_dir: "Path") -> dict:
-    """加载已保存的和谐版世界观；不存在或损坏时返回空 dict"""
+def load_desensitized_worldview(work_dir: "Path") -> dict:
+    """加载脱敏版世界观，仅当新文件不存在时兼容旧文件；损坏时返回空 dict。"""
     import json
-    hpath = get_harmonized_worldview_path(work_dir)
-    if hpath.exists():
+    from pathlib import Path
+
+    dpath = get_desensitized_worldview_path(work_dir)
+    # 新文件一旦存在就只读取它，避免损坏时悄悄恢复过期的旧缓存。
+    if not dpath.exists():
+        dpath = Path(work_dir) / '和谐版.worldview.json'
+    if dpath.exists():
         try:
-            with open(hpath, 'r', encoding='utf-8') as f:
+            with open(dpath, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             return data if isinstance(data, dict) else {}
         except (json.JSONDecodeError, Exception):
@@ -255,20 +260,20 @@ def load_harmonized_worldview(work_dir: "Path") -> dict:
     return {}
 
 
-def save_harmonized_worldview(work_dir: "Path", worldview: dict) -> None:
-    """保存和谐版世界观到 和谐版.worldview.json（UTF-8 无 BOM）"""
+def save_desensitized_worldview(work_dir: "Path", worldview: dict) -> None:
+    """保存脱敏版世界观到 脱敏版.worldview.json（UTF-8 无 BOM）"""
     import json
-    hpath = get_harmonized_worldview_path(work_dir)
-    hpath.parent.mkdir(parents=True, exist_ok=True)
-    with open(hpath, 'w', encoding='utf-8') as f:
+    dpath = get_desensitized_worldview_path(work_dir)
+    dpath.parent.mkdir(parents=True, exist_ok=True)
+    with open(dpath, 'w', encoding='utf-8') as f:
         json.dump(worldview, f, ensure_ascii=False, indent=2)
 
 
-# 和谐化改写规则：力度适中，只模糊"违背伦理"的高危表述（未成年/亲属关系/性暴力等），
+# 脱敏改写规则：力度适中，只模糊"违背伦理"的高危表述（未成年/亲属关系/性暴力等），
 # 成年角色间的成人向内容保留原样，其余描述尽量不动。
-# 拆为「规则部分」（可被 prompts.harmonize_system_prompt_file 自定义替换）
+# 拆为「规则部分」（可被 prompts.desensitize_system_prompt_file 自定义替换）
 # 和「输出要求」（内置保留，自定义 prompt 拼接在其之前）。
-HARMONIZE_RULES_PROMPT = (
+DESENSITIZE_RULES_PROMPT = (
     "你是一名内容合规编辑。用户提供一部虚构音声作品的设定资料（JSON 格式，"
     "含世界观简介、角色表、主题、特殊术语），你的任务是将其中的高危表述改写为合规版本，"
     "用于替代原资料参与后续翻译，这是一个常规的内容合规改写工作。\n\n"
@@ -285,8 +290,8 @@ HARMONIZE_RULES_PROMPT = (
     "不要过度改写，不要扩写或添加任何解释性文字。\n"
 )
 
-# 和谐化输出要求：内置保留（JSON 结构一致是解析硬依赖，name 不变是降级链第3级硬依赖）
-HARMONIZE_OUTPUT_REQUIREMENTS = (
+# 脱敏输出要求：内置保留（JSON 结构一致是解析硬依赖，name 不变是降级链第3级硬依赖）
+DESENSITIZE_OUTPUT_REQUIREMENTS = (
     "\n【输出要求】\n"
     "1. 输出 JSON 的结构、字段名、键与输入完全一致，只修改字符串内容。\n"
     "2. characters 中每个角色的 name 字段（日文原文称呼）保持不变，"
@@ -295,13 +300,13 @@ HARMONIZE_OUTPUT_REQUIREMENTS = (
 )
 
 # 兼容旧引用：完整内置 prompt = 规则 + 输出要求
-HARMONIZE_SYSTEM_PROMPT = HARMONIZE_RULES_PROMPT + HARMONIZE_OUTPUT_REQUIREMENTS
+DESENSITIZE_SYSTEM_PROMPT = DESENSITIZE_RULES_PROMPT + DESENSITIZE_OUTPUT_REQUIREMENTS
 
 
 def _temperature_override(engine) -> dict:
-    """世界观分析/和谐化的默认 temperature=0.1。
+    """世界观分析/脱敏的默认 temperature=0.1。
 
-    仅当对应用途的 api.worldview/api.harmonize.generation_params 显式配置了
+    仅当对应用途的 api.worldview/api.desensitize.generation_params 显式配置了
     temperature（由 _get_context_engine 在引擎上打 _purpose_temp_locked 标记）时
     才不覆盖；全局 temperature 不影响这两个用途，保持旧的 0.1 默认。
     """
@@ -310,21 +315,21 @@ def _temperature_override(engine) -> dict:
     return {'temperature': 0.1}
 
 
-def harmonize_worldview_with_llm(engine, worldview: dict, verbose: bool = False,
-                                 extra_system_prompt: str = None) -> tuple:
-    """调用 LLM 对世界观进行"和谐化"改写（NSFW 降级重试用）。
+def desensitize_worldview_with_llm(engine, worldview: dict, verbose: bool = False,
+                                  extra_system_prompt: str = None) -> tuple:
+    """调用 LLM 对世界观进行"脱敏"改写（NSFW 降级重试用）。
 
     参数:
         engine: 带 call_api(system_prompt, user_prompt, override_gen_params=...) 的引擎
         worldview: 原始世界观字典（会剥离 _source 等内部字段后发送）
         verbose: 是否打印调试信息
-        extra_system_prompt: 用户自定义的规则 prompt（config prompts.harmonize_system_prompt_file
+        extra_system_prompt: 用户自定义的规则 prompt（config prompts.desensitize_system_prompt_file
             的文件内容），**替换**内置改写规则部分；内置【输出要求】（JSON 结构一致、
             name 不变、只输出 JSON）始终保留在后，无需在自定义文件中重复。
             为空时使用纯内置规则。
 
     返回:
-        (和谐后的世界观 dict, token_stats)；失败（API 异常/JSON 解析失败/结构校验失败）返回 (None, token_stats)。
+        (脱敏后的世界观 dict, token_stats)；失败（API 异常/JSON 解析失败/结构校验失败）返回 (None, token_stats)。
         失败诊断放在 token_stats['failure_info']，包含 reason、raw 和 request_diagnostics。
     """
     import json as _json
@@ -338,9 +343,9 @@ def harmonize_worldview_with_llm(engine, worldview: dict, verbose: bool = False,
 
     # 自定义前置 prompt 在前（优先级高），内置【输出要求】始终保留在后（解析硬依赖）
     if extra_system_prompt and extra_system_prompt.strip():
-        system_prompt = f"{extra_system_prompt.strip()}\n\n{HARMONIZE_OUTPUT_REQUIREMENTS}"
+        system_prompt = f"{extra_system_prompt.strip()}\n\n{DESENSITIZE_OUTPUT_REQUIREMENTS}"
     else:
-        system_prompt = HARMONIZE_SYSTEM_PROMPT
+        system_prompt = DESENSITIZE_SYSTEM_PROMPT
 
     token_stats: dict = {}
     raw_output = ''
@@ -350,7 +355,7 @@ def harmonize_worldview_with_llm(engine, worldview: dict, verbose: bool = False,
             override_gen_params=_temperature_override(engine),
         )
     except Exception as e:
-        print(f"    ⚠ 世界观和谐化请求失败: {e}", flush=True)
+        print(f"    ⚠ 世界观脱敏请求失败: {e}", flush=True)
         # 保持双返回值契约，API 未正常返回时从异常取请求诊断。
         token_stats['failure_info'] = {
             'reason': f'API 调用异常: {e}', 'raw': raw_output,
@@ -359,25 +364,25 @@ def harmonize_worldview_with_llm(engine, worldview: dict, verbose: bool = False,
         return None, token_stats
 
     if not raw_output or not raw_output.strip():
-        print("    ⚠ 世界观和谐化返回为空", flush=True)
+        print("    ⚠ 世界观脱敏返回为空", flush=True)
         token_stats['failure_info'] = {
-            'reason': '世界观和谐化返回为空', 'raw': raw_output,
+            'reason': '世界观脱敏返回为空', 'raw': raw_output,
             'request_diagnostics': token_stats.get('request_diagnostics', []),
         }
         return None, token_stats
 
     json_match = re.search(r'\{.*\}', raw_output, re.DOTALL)
     if not json_match:
-        print(f"    ⚠ 世界观和谐化未返回 JSON（前200字: {raw_output[:200]}）", flush=True)
+        print(f"    ⚠ 世界观脱敏未返回 JSON（前200字: {raw_output[:200]}）", flush=True)
         token_stats['failure_info'] = {
-            'reason': '世界观和谐化未返回 JSON', 'raw': raw_output,
+            'reason': '世界观脱敏未返回 JSON', 'raw': raw_output,
             'request_diagnostics': token_stats.get('request_diagnostics', []),
         }
         return None, token_stats
     try:
         result = _json.loads(json_match.group())
     except _json.JSONDecodeError as e:
-        print(f"    ⚠ 世界观和谐化 JSON 解析错误: {e}", flush=True)
+        print(f"    ⚠ 世界观脱敏 JSON 解析错误: {e}", flush=True)
         token_stats['failure_info'] = {
             'reason': f'JSON 解析错误: {e}', 'raw': raw_output,
             'request_diagnostics': token_stats.get('request_diagnostics', []),
@@ -385,24 +390,24 @@ def harmonize_worldview_with_llm(engine, worldview: dict, verbose: bool = False,
         return None, token_stats
 
     if not isinstance(result, dict):
-        print("    ⚠ 世界观和谐化结果不是 JSON 对象", flush=True)
+        print("    ⚠ 世界观脱敏结果不是 JSON 对象", flush=True)
         token_stats['failure_info'] = {
-            'reason': '世界观和谐化结果不是 JSON 对象', 'raw': raw_output,
+            'reason': '世界观脱敏结果不是 JSON 对象', 'raw': raw_output,
             'request_diagnostics': token_stats.get('request_diagnostics', []),
         }
         return None, token_stats
 
     # 结构校验：至少要保留 characters（后续降级级别依赖它）；空结果视为失败
     if not result.get('characters') and not result.get('worldview'):
-        print("    ⚠ 世界观和谐化结果为空内容，视为失败", flush=True)
+        print("    ⚠ 世界观脱敏结果为空内容，视为失败", flush=True)
         token_stats['failure_info'] = {
-            'reason': '世界观和谐化结果为空内容', 'raw': raw_output,
+            'reason': '世界观脱敏结果为空内容', 'raw': raw_output,
             'request_diagnostics': token_stats.get('request_diagnostics', []),
         }
         return None, token_stats
 
     if verbose:
-        print(f"    [DEBUG] 和谐化完成: {len(result.get('characters', []))} 个角色", flush=True)
+        print(f"    [DEBUG] 脱敏完成: {len(result.get('characters', []))} 个角色", flush=True)
     return result, token_stats
 
 
@@ -648,3 +653,15 @@ def is_freetalk_context(path: "Path") -> tuple[bool, str | None]:
                 return True, cv_name
 
     return False, None
+
+
+# ==================== 旧 hdeg-translate 符号兼容 ====================
+# 仅保留同对象别名；旧调用也使用新路径与兼容读取逻辑，不维护重复实现。
+HARMONIZE_RULES_PROMPT = DESENSITIZE_RULES_PROMPT
+HARMONIZE_OUTPUT_REQUIREMENTS = DESENSITIZE_OUTPUT_REQUIREMENTS
+HARMONIZE_SYSTEM_PROMPT = DESENSITIZE_SYSTEM_PROMPT
+get_harmonized_worldview_path = get_desensitized_worldview_path
+load_harmonized_worldview = load_desensitized_worldview
+save_harmonized_worldview = save_desensitized_worldview
+harmonize_worldview_with_llm = desensitize_worldview_with_llm
+harmonize_with_llm = desensitize_worldview_with_llm

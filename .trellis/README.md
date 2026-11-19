@@ -5,6 +5,8 @@
 | 编号 | 任务 | 状态 | 文档 |
 | --- | --- | --- | --- |
 | 001 | HDEG 单进程转录翻译流水线改造 | review（回溯记录，待完整验收） | [任务目录](tasks/001/README.md) |
+| 001-ds | 以 Agent Skill 形式接入 harness-only 模型的 LRC 翻译 | planning（仅评估，未改代码） | [任务目录](tasks/001-ds/README.md) |
+| 001-6.1sol | HDEG 准备模式与纯翻译 Skill | review（HDEG 216/Skill 56 离线通过，待真实端到端） | [任务目录](tasks/001-6.1sol/README.md) |
 
 ## 本目录的范围
 

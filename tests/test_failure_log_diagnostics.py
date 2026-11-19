@@ -75,7 +75,7 @@ def test_translation_failure_log_contains_request_snapshot(tmp_path, api_excepti
         assert expected in text
 
 
-@pytest.mark.parametrize('purpose', ['worldview', 'harmonize'])
+@pytest.mark.parametrize('purpose', ['worldview', 'desensitize'])
 @pytest.mark.parametrize('api_exception', [False, True])
 def test_worldview_failure_diagnostics_and_log(tmp_path, purpose, api_exception):
     e = engine()
@@ -91,7 +91,7 @@ def test_worldview_failure_diagnostics_and_log(tmp_path, purpose, api_exception)
     if purpose == 'worldview':
         _, _, fail = wv.analyze_worldview_with_llm(e, ['样本'])
     else:
-        _, stats = wv.harmonize_worldview_with_llm(e, ORIG_WV)
+        _, stats = wv.desensitize_worldview_with_llm(e, ORIG_WV)
         fail = stats['failure_info']
     orch._write_worldview_failure_log(tmp_path, fail, purpose=purpose)
     log_file = tmp_path / 'log' / (purpose + '.log')
@@ -101,13 +101,13 @@ def test_worldview_failure_diagnostics_and_log(tmp_path, purpose, api_exception)
     assert log_file.read_text(encoding='utf-8').count('请求记录 1') == 2
 
 
-def test_ensure_harmonized_failure_writes_log(tmp_path):
+def test_ensure_desensitized_failure_writes_log(tmp_path):
     ctx = make_ctx(FakeEngine())
     e = engine()
     e.call_api = lambda *a, **k: ('not json', {'request_diagnostics': [diagnostic()]})
-    ctx._harmonize_engine = e
-    assert orch._ensure_harmonized_worldview(ctx, str(tmp_path), ORIG_WV) is None
-    assert 'mock-server' in (tmp_path / 'log' / 'harmonize.log').read_text(encoding='utf-8')
+    ctx._desensitize_engine = e
+    assert orch._ensure_desensitized_worldview(ctx, str(tmp_path), ORIG_WV) is None
+    assert 'mock-server' in (tmp_path / 'log' / 'desensitize.log').read_text(encoding='utf-8')
 
 
 def test_missing_diagnostics_not_guessed():

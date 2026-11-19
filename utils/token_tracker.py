@@ -139,7 +139,8 @@ class TokenTracker:
             'scriptbook_split': '台本分割',
             'worldview': '世界观',
             'terms': '术语',
-            'harmonize': '和谐化',
+            'desensitize': '脱敏',
+            'harmonize': '脱敏',  # 兼容旧用途统计记录。
         }
         for r in self.records:
             tcn = TYPE_CN_MAP.get(r.request_type, r.request_type)

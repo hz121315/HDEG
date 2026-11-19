@@ -1,0 +1,7 @@
+{
+  "hdeg_root": "C:/Users/Administrator/IdeaProjects/HDEG",
+  "python_exe": "C:/Users/Administrator/IdeaProjects/HDEG/.venv/Scripts/python.exe",
+  "app": {
+    "max_parallel_subagents": 2
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "id": "001-6.1sol",
+  "name": "001-6.1sol",
+  "title": "HDEG 准备模式与纯翻译 Skill",
+  "status": "review",
+  "priority": "P1",
+  "branch": "main",
+  "base_branch": "main",
+  "parent": null,
+  "children": [],
+  "commit": null,
+  "pr_url": null,
+  "meta": {
+    "record_type": "implementation",
+    "created_on": "2026-11-18",
+    "related_tasks": ["001"],
+    "trellis_initialized": false,
+    "status_reason": "2026-11-19 已实现 HDEG prepare_only 默认关闭的独立准备模式和 hz-rj-translate 纯消费改造；生产/消费交接及旧模式离线回归通过，真实 API/GPU/宿主翻译待验收。",
+    "authorization_scope": "已批准HDEG准备模式与纯Skill改造，以及脱敏术语/字段/符号/路径命名迁移和旧读取兼容；不改变现有策略或normalized格式，不改本地真实配置凭据、旧Skill或其他任务，不运行真实API/GPU，不构建提交或推送。",
+    "verification": "最新命名迁移回归：HDEG 216 passed、1 live deselected；Skill 56 unittest passed。新旧字段优先级、缓存回退与旧导入符号兼容通过；处理规则及normalized schema未变。原有跨端、静态与差异检查通过，真实API/GPU/Agent翻译仍未验收。官方Skill校验器缺PyYAML，未安装。",
+    "updated_on": "2026-11-19",
+    "skill_path": "C:/Users/Administrator/.gemini/config/skills/hz-rj-translate",
+    "artifacts": ["README.md", "prd.md", "design.md", "implement.md"]
+  }
+}

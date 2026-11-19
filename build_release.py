@@ -507,8 +507,15 @@ def copy_config():
     
     with open(config_src, 'r', encoding='utf-8') as f:
         config = json.load(f)
-    
-    # 清空全部 API 配置层级的凭证，包含独立 worldview/harmonize、预设及注册表。
+    # 只迁移发布副本的字段，本地配置文件与自定义旧 prompt 路径保持不动。
+    from io_adapter.config_loader import _apply_desensitize_aliases
+    _apply_desensitize_aliases(config)
+    if isinstance(config.get('api'), dict):
+        config['api'].pop('harmonize', None)
+    if isinstance(config.get('prompts'), dict):
+        config['prompts'].pop('harmonize_system_prompt_file', None)
+
+    # 清空全部 API 配置层级的凭证，包含独立 worldview/desensitize、预设及注册表。
     # 发布时不打印凭证前缀，避免构建日志也泄露 key。
     def clear_credentials(value):
         if isinstance(value, dict):
@@ -557,6 +564,7 @@ def copy_config():
 
         # 新版本新增参数：确保发布件包含合理默认值
         defaults_app = {
+            "prepare_only": False,
             "translate_failed_max_retries": 3,
             "save_track_logs": True,
             "track_log_detail": True,
@@ -622,13 +630,13 @@ def copy_config():
         print("  设置默认: model=deepseek-flash, base_url=https://api.deepseek.com, "
               "active_preset=deepseek-official（用户仅需填 key）")
 
-        # 世界观和谐化专用 API 子段（空值 = 复用翻译 API；显式占位供用户填写）
-        if not isinstance(api.get("harmonize"), dict):
-            api["harmonize"] = {}
+        # 世界观脱敏专用 API 子段（空值 = 复用翻译 API；显式占位供用户填写）
+        if not isinstance(api.get("desensitize"), dict):
+            api["desensitize"] = {}
         for _hk in ("key", "base_url", "model", "protocol"):
-            api["harmonize"].setdefault(_hk, "")
-        api["harmonize"].setdefault("generation_params", {})
-        print("  补齐 api.harmonize 占位（空 = 复用翻译 API；generation_params 可覆盖全局参数）")
+            api["desensitize"].setdefault(_hk, "")
+        api["desensitize"].setdefault("generation_params", {})
+        print("  补齐 api.desensitize 占位（空 = 复用翻译 API；generation_params 可覆盖全局参数）")
 
     # 世界观分析专用 API 子段（空值 = 复用翻译 API；显式占位供用户填写）
     if not isinstance(api.get("worldview"), dict):
@@ -641,9 +649,9 @@ def copy_config():
     # prompt 引用键占位；随后若生成 prompts/ 目录则指向其中文件
     if not isinstance(config.get("prompts"), dict):
         config["prompts"] = {}
-    config["prompts"].setdefault("harmonize_system_prompt_file", "")
+    config["prompts"].setdefault("desensitize_system_prompt_file", "")
     config["prompts"].setdefault("worldview_system_prompt_file", "")
-    print("  补齐 prompts.harmonize/worldview_system_prompt_file 占位")
+    print("  补齐 prompts.desensitize/worldview_system_prompt_file 占位")
 
     # 全局代理开关：发布件默认不强制清代理（交给 api.clear_proxy 与系统代理）
     if isinstance(config.get("network"), dict):
@@ -695,7 +703,7 @@ def copy_config():
 
     print(f"OK 处理后的 config.json 已保存到: {config_dst}")
 
-    # ── 生成 prompts/ 目录：导出世界观分析与和谐化改写的规则文本，发布件默认引用 ──
+    # ── 生成 prompts/ 目录：导出世界观分析与脱敏改写的规则文本，发布件默认引用 ──
     # 用户可直接编辑这两个文件调整规则（内置【输出要求】不导出，运行时始终附加，
     # JSON 结构/name 字段等解析硬依赖不会因编辑而破坏）。
     try:
@@ -703,14 +711,16 @@ def copy_config():
         if str(SCRIPT_DIR) not in _sys.path:
             _sys.path.insert(0, str(SCRIPT_DIR))
         from engines.worldview_engine import (
-            WORLDVIEW_ANALYSIS_RULES_PROMPT, HARMONIZE_RULES_PROMPT,
+            WORLDVIEW_ANALYSIS_RULES_PROMPT, DESENSITIZE_RULES_PROMPT,
         )
         prompts_dir = RELEASE_DIR / "prompts"
         prompts_dir.mkdir(parents=True, exist_ok=True)
         wv_file = prompts_dir / "worldview.txt"
-        hm_file = prompts_dir / "harmonize.txt"
+        hm_file = prompts_dir / "desensitize.txt"
         wv_file.write_text(WORLDVIEW_ANALYSIS_RULES_PROMPT, encoding='utf-8')
-        hm_file.write_text(HARMONIZE_RULES_PROMPT, encoding='utf-8')
+        hm_file.write_text(DESENSITIZE_RULES_PROMPT, encoding='utf-8')
+        # 仅兼容已有配置的旧相对路径；新发布配置始终引用 desensitize.txt。
+        (prompts_dir / 'harmonize.txt').write_text(DESENSITIZE_RULES_PROMPT, encoding='utf-8')
         # 翻译内置 prompt：从仓库 prompts/translation.txt 复制到发布目录，供用户直接编辑
         tr_src = SCRIPT_DIR / "prompts" / "translation.txt"
         if tr_src.exists():
@@ -720,7 +730,7 @@ def copy_config():
             print("  ⚠ 未找到 prompts/translation.txt，翻译提示词仍使用 exe 内嵌副本")
         # config 默认指向这三个文件（相对路径，相对进程 CWD；程序目录兜底解析）
         config["prompts"]["worldview_system_prompt_file"] = "prompts/worldview.txt"
-        config["prompts"]["harmonize_system_prompt_file"] = "prompts/harmonize.txt"
+        config["prompts"]["desensitize_system_prompt_file"] = "prompts/desensitize.txt"
         with open(config_dst, 'w', encoding='utf-8') as f:
             json.dump(config, f, ensure_ascii=False, indent=2)
         print(f"OK prompts/ 已生成并默认引用: {wv_file.name}, {hm_file.name}, translation.txt")
